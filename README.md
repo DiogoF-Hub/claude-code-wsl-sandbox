@@ -734,3 +734,9 @@ Both are WSL-specific and worth reporting to
 2. **`--display` exposes VS Code IPC sockets on WSL.** `XDG_RUNTIME_DIR` resolves to
    `/mnt/wslg/runtime-dir`, where VS Code Server stores `vscode-ipc-*.sock` and
    `vscode-git-*.sock`. This is a real sandbox-escape path, not just noise.
+
+---
+
+## License
+
+[CC0 1.0 Universal](LICENSE). Public domain, no attribution required, though it is always appreciated.
