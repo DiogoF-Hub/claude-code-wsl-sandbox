@@ -1,2 +1,736 @@
-# claude-code-wsl-sandbox
-Run Claude Code on Windows inside a real Linux sandbox. WSL 2 + ai-jail (bubblewrap, Landlock, seccomp) so the agent can only touch your project, with SSH commit signing still backed by Bitwarden.
+# Sandboxed Claude Code on Windows (WSL 2 + ai-jail + Bitwarden SSH signing)
+
+A reproducible setup for running an AI coding agent on Windows inside an OS-level
+sandbox, while keeping SSH commit signing backed by Bitwarden.
+
+The agent can only read and write the project directory. It cannot reach `~/.ssh`,
+the Windows filesystem, or any Windows executable. Commits are still signed by the
+key held in Bitwarden, which never touches disk.
+
+## Why I built this
+
+This is my personal setup, documented so I can rebuild it and so others can copy the
+parts they want.
+
+The motivation is **not** fear of malware. I do not assume Claude Code is compromised or
+hostile. The problem is a much more ordinary one: an agent that wanders. Left
+unconstrained it will run `reg.exe` queries, poke at Windows config, read dotfiles, or
+start "helpfully" fixing things nowhere near the code I asked about. Sometimes it goes
+far beyond the request, which is scope creep rather than sabotage.
+
+So the goal is containment of *reach*, not defence against an attacker. When I ask for
+help with a project, the agent should only be able to act on that project. Everything
+else on the machine is simply not there. As a bonus, the same boundary happens to limit
+the damage if a repo ever does contain a prompt injection.
+
+Worth being clear about the limit: the sandbox constrains **where** the agent can act,
+not **how much** it does. For bounding behaviour, see
+[Security notes](#scope-creep-is-not-a-security-control).
+
+> Paths below assume the username `diogo` on both Windows and WSL. Adjust as needed.
+
+---
+
+## Table of contents
+
+1. [Why WSL](#why-wsl)
+2. [How it fits together](#how-it-fits-together)
+3. [Part 1: WSL base setup](#part-1-wsl-base-setup)
+4. [Part 2: VS Code](#part-2-vs-code)
+5. [Part 3: Claude Code](#part-3-claude-code)
+6. [Part 4: mise, ai-jail and Node](#part-4-mise-ai-jail-and-node)
+7. [Part 5: Bitwarden SSH agent bridge](#part-5-bitwarden-ssh-agent-bridge)
+8. [Part 6: Git signing in WSL](#part-6-git-signing-in-wsl)
+9. [Part 7: Git signing on Windows](#part-7-git-signing-on-windows)
+10. [Part 8: The .ai-jail config](#part-8-the-ai-jail-config)
+11. [Maintenance](#maintenance)
+12. [Troubleshooting](#troubleshooting)
+13. [Security notes](#security-notes)
+
+---
+
+## Why WSL
+
+[ai-jail](https://github.com/akitaonrails/ai-jail) has no native Windows support and
+will not get it. Its Linux backend is `bubblewrap` (namespaces + Landlock LSM +
+seccomp); its macOS backend is `sandbox-exec`. Windows has no userspace equivalent.
+AppContainers are a different API, need admin to configure, and do not map onto what
+bwrap does.
+
+WSL 2 runs a real Linux kernel, so bwrap works normally. Claude Code must therefore be
+installed **inside the WSL distro**, not on Windows, because ai-jail sandboxes the Linux
+binary.
+
+A useful side effect: inside the jail there is no `/mnt`, so `reg.exe`,
+`powershell.exe` and `cmd.exe` are unreachable. The agent cannot touch Windows at all.
+
+## How it fits together
+
+```
+Windows                              │  WSL 2 (Ubuntu)
+─────────────────────────────────────┼──────────────────────────────────────
+Bitwarden Desktop                    │
+  └── \\.\pipe\openssh-ssh-agent  ◄──┼── npiperelay.exe ◄── socat
+                                     │        ▲                 ▲
+VS Code (Remote-WSL)  ───────────────┼────────┼─────────────────┤
+                                     │        │      ~/.ssh/agent.sock.$$
+                                     │        │                 ▲
+                                     │   git commit -S ─────────┘
+                                     │
+                                     │   ai-jail ──► bwrap ──► claude
+                                     │                  (project dir only)
+```
+
+Commits are made **outside** the jail. The agent writes code; you commit.
+
+## Prerequisites
+
+- Windows 11 with WSL 2 and an Ubuntu distro
+- Bitwarden Desktop with the SSH agent enabled. See the
+  [official Bitwarden SSH agent guide](https://bitwarden.com/help/ssh-agent/) and
+  [Part 7](#part-7-git-signing-on-windows) below for the full Windows walkthrough
+- An SSH key stored in Bitwarden
+
+---
+
+## Part 1: WSL base setup
+
+### 1.1 `.wslconfig` (Windows side)
+
+`C:\Users\diogo\.wslconfig`:
+
+```ini
+[wsl2]
+# 1. Shut the VM down as soon as all WSL instances have exited
+vmIdleTimeout=0
+```
+
+This trades a few seconds of start-up delay for the VM not sitting idle in the
+background. It only takes effect once **no process** is left running in the distro.
+See [Part 5.4](#54-why-the-relay-must-die-with-the-shell) for why the SSH relay matters
+here.
+
+### 1.2 Fix `/etc/resolv.conf` (required for ai-jail)
+
+By default WSL makes `/etc/resolv.conf` a **symlink** to `/mnt/wsl/resolv.conf`.
+bwrap cannot bind over that symlink and ai-jail fails to start with:
+
+```
+bwrap: Can't create file at /etc/resolv.conf: No such file or directory
+```
+
+The fix is to make it a regular file with the same contents. First, note your current
+nameserver and search domain:
+
+```bash
+cat /etc/resolv.conf
+```
+
+Then:
+
+```bash
+sudo tee /etc/wsl.conf > /dev/null << 'EOF'
+[network]
+generateResolvConf = false
+EOF
+```
+
+Shut down from PowerShell so `wsl.conf` takes effect **before** writing the file:
+
+```powershell
+wsl --shutdown
+```
+
+Reopen WSL, then:
+
+```bash
+# 1. Remove the symlink
+sudo rm -f /etc/resolv.conf
+
+# 2. Write a regular file with the same values noted above
+printf 'nameserver 10.255.255.254\nsearch <your-tailnet>.ts.net\n' | sudo tee /etc/resolv.conf
+
+# 3. Confirm it is a regular file (expect -rw-r--r--, no arrow)
+ls -l /etc/resolv.conf
+ping -c1 github.com
+```
+
+Notes:
+
+- `10.255.255.254` is WSL's DNS proxy into the Windows resolver. It is a fixed address
+  and does not drift across reboots, so you keep whatever DNS Windows is using,
+  including Tailscale MagicDNS and any Pi-hole filtering.
+- The `search` line only matters for bare single-label hostnames. Drop it if you do not
+  use MagicDNS.
+- Trade-off: WSL no longer updates this file automatically. If you join a VPN that
+  pushes its own search domains, add them by hand.
+- Revert with `sudo rm /etc/wsl.conf /etc/resolv.conf` then `wsl --shutdown`.
+
+> Order matters. Writing the file before `wsl --shutdown` lets WSL recreate the symlink
+> on the next boot.
+
+---
+
+## Part 2: VS Code
+
+Install the **WSL** extension in Windows VS Code, then launch from inside the distro:
+
+```bash
+cd ~/Projects/my-app
+code .
+```
+
+The bottom-left corner should read `WSL: Ubuntu`. VS Code Server runs *outside* the
+jail, so it sees and edits the project normally. You watch every agent edit live.
+
+**Keep repositories in `~/Projects`, not `/mnt/c`.** On `/mnt/c` the DrvFS mount has
+poor inotify support, so VS Code often fails to auto-refresh when the agent writes
+files, which defeats the purpose. It also has no real Unix permission bits, so git
+reports phantom mode changes (`git config core.fileMode false` if you hit it).
+
+---
+
+## Part 3: Claude Code
+
+Use the native installer. It needs no Node.js and avoids the common WSL failure where
+`npm install -g` picks up the *Windows* npm and errors on a platform mismatch.
+
+```bash
+curl -fsSL https://claude.ai/install.sh | bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc && source ~/.bashrc
+claude --version
+```
+
+Run `claude` once to log in. This is a **separate login** from any Windows-side install,
+because WSL has its own `~/.claude`. Use `claude doctor` to diagnose install problems.
+
+---
+
+## Part 4: mise, ai-jail and Node
+
+[mise](https://mise.jdx.dev/) manages tool versions per project and installs standalone
+binaries from GitHub releases. ai-jail has built-in mise integration, so tools it
+manages are exposed correctly inside the jail.
+
+```bash
+curl https://mise.run | sh
+echo "eval \"\$(/home/diogo/.local/bin/mise activate bash)\"" >> ~/.bashrc
+exec bash
+
+sudo apt update && sudo apt install -y bubblewrap socat
+mise use -g github:akitaonrails/ai-jail
+mise use -g node@lts    # example only, use whatever runtime the project needs
+
+ai-jail --version
+```
+
+If you previously installed ai-jail by hand, remove it so there is only one copy:
+
+```bash
+rm -f ~/.local/bin/ai-jail
+exec bash
+which -a ai-jail     # expect a single path under ~/.local/share/mise/installs/
+```
+
+> `mise upgrade` refuses releases younger than 24 hours (`minimum_release_age`) as a
+> supply-chain guard. A new release is picked up on the next run once it has aged in.
+> `mise upgrade --bump` bypasses it, but leave the default alone.
+
+---
+
+## Part 5: Bitwarden SSH agent bridge
+
+Bitwarden's SSH agent listens on a Windows **named pipe** (`\\.\pipe\openssh-ssh-agent`).
+Linux tools speak to a **Unix domain socket**. `npiperelay.exe` bridges the two:
+it opens the named pipe and relays it over stdin/stdout, while `socat` creates the Unix
+socket on the Linux side and spawns the relay per connection.
+
+The private key never enters WSL. Only the sign request and the signature cross.
+
+Enable the agent in Bitwarden Desktop first. Full walkthrough in
+[Part 7](#part-7-git-signing-on-windows), or see
+[bitwarden.com/help/ssh-agent](https://bitwarden.com/help/ssh-agent/).
+
+### 5.1 Install npiperelay (Windows)
+
+Use the actively maintained [albertony fork](https://github.com/albertony/npiperelay).
+The original (`jstarks`) has not been updated since 2020.
+
+```powershell
+winget install albertony.npiperelay
+where.exe npiperelay
+```
+
+Open a **new** PowerShell window before running `where.exe`, because the PATH change
+does not reach already-running terminals.
+
+### 5.2 Symlink it into WSL
+
+Symlinking rather than copying means `winget upgrade` maintains the binary and the
+bridge follows automatically:
+
+```bash
+sudo ln -s "/mnt/c/Users/diogo/AppData/Local/Microsoft/WinGet/Packages/albertony.npiperelay_Microsoft.Winget.Source_8wekyb3d8bbwe/npiperelay.exe" \
+    /usr/local/bin/npiperelay.exe
+
+/usr/local/bin/npiperelay.exe    # expect the usage text
+```
+
+Adjust the path to whatever `where.exe npiperelay` reported.
+
+### 5.3 The `.bashrc` block
+
+Append to `~/.bashrc`:
+
+```bash
+# Bitwarden SSH agent bridge (per-shell; dies with this shell)
+export SSH_AUTH_SOCK="$HOME/.ssh/agent.sock.$$"
+socat UNIX-LISTEN:"$SSH_AUTH_SOCK",fork,unlink-early \
+    EXEC:"npiperelay.exe -ei -s //./pipe/openssh-ssh-agent",nofork >/dev/null 2>&1 &
+SOCAT_PID=$!
+trap 'kill $SOCAT_PID 2>/dev/null; rm -f "$SSH_AUTH_SOCK"' EXIT
+```
+
+Then verify:
+
+```bash
+mkdir -p ~/.ssh && chmod 700 ~/.ssh
+exec bash
+ssh-add -l    # expect your key fingerprint
+```
+
+Design notes:
+
+- **`.$$` suffix**: each shell gets its own socket, so two terminals never fight over
+  one path.
+- **`unlink-early`**: removes a stale socket file left by a crashed shell.
+- **`trap ... EXIT`**: kills the relay when the shell exits. No interactive guard is
+  needed, because Ubuntu's stock `.bashrc` already returns early for non-interactive
+  shells.
+
+### 5.4 Why the relay must die with the shell
+
+A detached relay (`setsid`) survives every terminal, which keeps the distro alive and
+silently defeats `vmIdleTimeout=0`. The per-shell version above lets the VM shut down
+once the last shell closes.
+
+Confirm with:
+
+```powershell
+wsl --list --running    # expect "There are no running distributions"
+```
+
+Known trade-off: VS Code captures `SSH_AUTH_SOCK` once when it resolves the shell
+environment, so the **git panel** may end up with a dead socket path. The **integrated
+terminal** always works, since each terminal spawns its own live relay. Commit from the
+terminal.
+
+---
+
+## Part 6: Git signing in WSL
+
+### 6.1 Register the key on GitHub twice
+
+GitHub stores authentication keys and signing keys as **separate resources**. The same
+public key must be added twice, once as an *Authentication Key* and once as a *Signing
+Key*. This is the intended setup, not a duplicate.
+
+Symptom of a missing auth key: `git@github.com: Permission denied (publickey)` even
+though signing works. Symptom of a missing signing key: commits land **Unverified**.
+
+Verify with:
+
+```bash
+ssh -T git@github.com    # expect "Hi <user>! You've successfully authenticated"
+```
+
+> Never delete an existing Signing entry to re-add it as Authentication, because that
+> breaks verification on all existing signed commits. Add, do not replace.
+
+### 6.2 Git config in WSL
+
+```bash
+# 1. Copy the public key from Windows so both sides match
+cp /mnt/c/Users/diogo/.ssh/bitwarden_signing.pub ~/.ssh/
+chmod 644 ~/.ssh/bitwarden_signing.pub
+
+# 2. Identity, must match the Windows config or GitHub splits your contributions
+git config --global user.name "Diogo"
+git config --global user.email "diogo@carvalhofer.lu"
+
+# 3. Sign with SSH rather than GPG
+git config --global gpg.format ssh
+git config --global user.signingkey "$HOME/.ssh/bitwarden_signing.pub"
+git config --global commit.gpgsign true
+```
+
+Two settings that look contradictory but are not:
+
+- `gpg.format` selects the **backend** (`openpgp`, `ssh`, `x509`)
+- `commit.gpgsign` selects **whether to sign at all**. The name is historical, from
+  when GPG was the only option.
+
+Do **not** copy these two lines from a Windows `.gitconfig`:
+
+| Windows line | Why it breaks in WSL |
+| --- | --- |
+| `user.signingkey=C:\Users\...` | Windows path, will not resolve |
+| `gpg.ssh.program=C:/Windows/System32/OpenSSH/ssh-keygen.exe` | Git passes it Linux temp paths the Windows binary cannot read, so signing fails outright |
+
+The same reason rules out the commonly suggested `alias ssh=ssh.exe` trick: it fixes
+push and pull, but never signing.
+
+### 6.3 Local verification (optional)
+
+Without this, `git log --show-signature` reports
+`gpg.ssh.allowedSignersFile needs to be configured` and shows `No signature`, even
+though the commit **is** signed and GitHub shows Verified.
+
+```bash
+echo "diogo@carvalhofer.lu $(cat ~/.ssh/bitwarden_signing.pub)" > ~/.ssh/allowed_signers
+git config --global gpg.ssh.allowedSignersFile ~/.ssh/allowed_signers
+git log --show-signature -1    # expect: Good "git" signature
+```
+
+Optionally import GitHub's web-flow key so commits created in the GitHub UI verify too:
+
+```bash
+curl -sL https://github.com/web-flow.gpg | gpg --import
+```
+
+---
+
+## Part 7: Git signing on Windows
+
+Standalone and independent of everything above. This is how to get the **Verified**
+badge for commits made from a normal Windows VS Code window or PowerShell prompt. It is
+not required for the WSL workflow, but it is the natural companion to it, and steps 1
+and 2 are prerequisites for the WSL bridge in [Part 5](#part-5-bitwarden-ssh-agent-bridge)
+as well.
+
+> Signing is separate from pushing. Pushing already works without any of this. Signing
+> just proves the commit author is really you, which is what earns the Verified badge.
+
+### Step 1: Disable the Windows OpenSSH Authentication Agent
+
+Bitwarden's SSH agent uses the same Windows named pipe as the built-in OpenSSH agent, so
+the built-in one has to be turned off first.
+
+1. Press `Win + R`, type `services.msc`, press Enter.
+2. Find **OpenSSH Authentication Agent**.
+3. Double-click it.
+4. Set **Startup type** to **Disabled**.
+5. Click **Stop**, then **OK**.
+
+> This affects all SSH usage on the machine, not just Git. Any SSH connections (homelab,
+> servers) now go through Bitwarden's agent too.
+
+### Step 2: Enable Bitwarden as SSH agent
+
+1. Open Bitwarden Desktop (version 2025.1.2 or newer).
+2. Go to **Settings** then **Security**.
+3. Enable **Use Bitwarden as SSH agent**.
+4. Set **Ask for authorization** to **Always**.
+
+Reference: [bitwarden.com/help/ssh-agent](https://bitwarden.com/help/ssh-agent/)
+
+### Step 3: Generate the signing key in Bitwarden
+
+Skip if the key already exists.
+
+1. Click the **+** button, then **SSH Key**.
+2. Name it something like `GitHub Signing Key - Windows`.
+3. Click **Generate**, then choose **Ed25519**.
+4. Save the item.
+5. Copy the **public key** (starts with `ssh-ed25519 AAAA...`).
+
+### Step 4: Register the public key on GitHub
+
+1. GitHub, then **Settings**, **SSH and GPG keys**, **New SSH key**.
+2. Title: `Bitwarden Signing - Windows`.
+3. **Key type: Signing Key.** This is the important part. The default is
+   "Authentication Key", which will NOT verify commits.
+4. Paste the public key, then **Add SSH key**.
+
+If you also push over SSH, repeat this with **Key type: Authentication Key**. See
+[6.1](#61-register-the-key-on-github-twice).
+
+### Step 5: Save the public key as a file
+
+```powershell
+# 1. Create the .ssh folder if it does not exist
+New-Item -Path "$env:USERPROFILE\.ssh" -ItemType Directory -Force
+
+# 2. Save the public key (replace the placeholder with the value copied from Bitwarden)
+Set-Content -Path "$env:USERPROFILE\.ssh\bitwarden_signing.pub" -Value "ssh-ed25519 AAAA... PASTE_YOUR_PUBLIC_KEY_HERE"
+```
+
+### Step 6: Configure Git
+
+```powershell
+# 1. Use SSH (not GPG) for signing
+git config --global gpg.format ssh
+
+# 2. Point Git at the public key file
+git config --global user.signingkey "$env:USERPROFILE\.ssh\bitwarden_signing.pub"
+
+# 3. Sign every commit by default
+git config --global commit.gpgsign true
+
+# 4. Use Windows OpenSSH ssh-keygen so it can talk to Bitwarden's named pipe
+git config --global gpg.ssh.program "C:/Windows/System32/OpenSSH/ssh-keygen.exe"
+```
+
+Step 4 is the one that matters most. Git for Windows bundles its own MSYS2
+`ssh-keygen`, which expects a Unix socket and cannot reach a Windows named pipe, so
+signing fails silently or errors out. Pointing `gpg.ssh.program` at the *Windows*
+OpenSSH binary makes it talk to Bitwarden directly.
+
+Confirm the Git email matches a verified email on GitHub, otherwise commits sign but
+show as **Unverified**:
+
+```powershell
+# 1. Check the configured email
+git config --global user.email
+
+# 2. If it is wrong, set it to a verified GitHub email
+git config --global user.email "diogo@carvalhofer.lu"
+```
+
+For SSH remotes (skip if you push over HTTPS), the same named-pipe issue applies to the
+transport:
+
+```powershell
+git config --global core.sshCommand "C:/Windows/System32/OpenSSH/ssh.exe"
+```
+
+### Step 7: Test in VS Code
+
+VS Code uses the global Git config, so nothing extra to configure inside it.
+
+1. Open a repo in VS Code.
+2. Make a small change, stage it, commit via the Source Control panel.
+3. Bitwarden pops up an authorization prompt, click **Authorize**.
+4. Push the commit.
+5. On GitHub, refresh the commit and confirm the **Verified** badge.
+
+### Windows troubleshooting
+
+| Symptom | Likely cause |
+| --- | --- |
+| Commit shows **Unverified** | Git email does not match a verified GitHub email, or the key on GitHub is set as **Authentication** instead of **Signing** |
+| `gpg failed to sign the data` | Bitwarden Desktop not running, vault locked, or wrong `gpg.ssh.program` path |
+| No Bitwarden authorization prompt | SSH agent not enabled in Bitwarden, or the Windows OpenSSH agent was not properly disabled |
+| Commit signs but no prompt ever appears | "Ask for authorization" is set to **Never** instead of **Always** |
+| Prompt appears when opening a VS Code window | VS Code Git auto-fetch, which is an *authentication* request rather than signing. Read the dialog text to tell them apart. Disable per-project with `"git.autofetch": false` in `.vscode/settings.json` |
+
+### Good to know
+
+- The key lives in the Bitwarden vault (cloud-synced), so it is available on every
+  machine logged into the same account. One key, registered once on GitHub.
+- Revoking the key on GitHub revokes it for **all** machines using it. Past commits keep
+  their Verified status regardless.
+- To isolate machines instead, generate a separate key in Bitwarden per machine and add
+  each as its own Signing Key on GitHub.
+- `gpg.ssh.program` and `core.sshCommand` are **Windows-only**. Never copy them into the
+  WSL config, see the table in [6.2](#62-git-config-in-wsl).
+
+---
+
+## Part 8: The .ai-jail config
+
+### My base template
+
+This is the config I start from for every project. Commit it so the policy syncs across
+machines.
+
+```toml
+# ai-jail sandbox configuration
+# https://github.com/akitaonrails/ai-jail
+# Edit freely. Regenerate with: ai-jail --clean --init
+
+command = ["claude"]
+hide_dotdirs = [
+    ".azure",
+    ".vscode-server",
+]
+mask = [
+    ".env",
+    ".env.local",
+]
+no_gpu = true
+no_display = true
+```
+
+It gets adapted per project (extra masks for whatever secrets that repo actually holds),
+but this is the base.
+
+### How to create it
+
+Two ways, both fine:
+
+1. **Write the file by hand.** Copy the template above into `.ai-jail` at the project
+   root. Simplest and fully predictable.
+2. **Run the full command once with `--init`.** ai-jail parses the flags and writes them
+   in the correct format, then exits without launching anything:
+
+```bash
+cd ~/Projects/my-app
+ai-jail --no-gpu --no-display \
+    --hide-dotdir .azure --hide-dotdir .vscode-server \
+    --mask .env --mask .env.local \
+    --init claude
+```
+
+Do **not** include `--resume` here. `--init` assumes a clean starting point, and there
+is nothing to resume yet.
+
+I prefer one of those two over letting the file build itself up from stray flags, for
+the reason below.
+
+### Auto-save gotcha
+
+`--save-config` is **on by default**: any flag passed on the command line is silently
+written into `.ai-jail` and applies to every later run. This includes
+`claude --resume <id>`, which gets recorded as part of `command` and pins that session
+forever, and `--private-home`, which silently hides `~/.claude` and forces a fresh login
+every time.
+
+- Put ai-jail flags **before** the command, and avoid passing Claude's own flags after it
+- Use `--no-save-config` for anything experimental
+- Use `--init` to write a config deliberately
+- When ai-jail behaves oddly, `cat .ai-jail` first
+
+### What each option does
+
+| Option | Why |
+| --- | --- |
+| `no_display = true` | **The important one.** On WSL, `XDG_RUNTIME_DIR` resolves to `/mnt/wslg/runtime-dir`, where VS Code Server drops `vscode-ipc-*.sock`. Anything able to write to that socket can drive the host VS Code, opening files anywhere and spawning processes outside the jail. Display passthrough drags it in as collateral. Claude Code is a TUI, so nothing is lost. |
+| `no_gpu = true` | No `/dev/dxg`, `/dev/dri` or `/dev/nvidia*` under WSL, so GPU passthrough adds 9p/overlay mount surface for zero capability. |
+| `hide_dotdirs` | `.azure` is bind-mounted from `C:\Users\...` and would expose CLI tokens if populated. `.vscode-server` is not needed by the agent. `.docker` and `.claude` cannot be hidden, ai-jail refuses because they are required. |
+| `mask` | Replaces matching files with empty ones. The whole project directory is readable, so secrets in-repo need masking explicitly. `--deny-path` throws a permission error instead of returning empty. |
+
+### Running it
+
+```bash
+cd ~/Projects/my-app
+ai-jail --dry-run claude    # inspect the mount plan
+ai-jail claude              # run for real
+```
+
+To resume a previous session, either use `/resume` from inside Claude Code, or pass the
+flag with auto-save disabled so the session ID is not written into `.ai-jail`:
+
+```bash
+ai-jail --no-save-config claude --resume 11f2b4c6-625a-4650-b0c2-96cf276f91f4
+```
+
+Workflow: the agent edits inside the jail, you commit from a normal terminal. The jail
+does not forward `SSH_AUTH_SOCK` and does not mount `~/.ssh`, so commits from inside
+cannot be signed.
+
+---
+
+## Maintenance
+
+| What | Command |
+| --- | --- |
+| ai-jail, Node, system packages | `all-update` (alias below) |
+| npiperelay, everything Windows | `winget upgrade --all` |
+| Claude Code | self-updating |
+
+A single alias for the WSL side:
+
+```bash
+echo "alias all-update='sudo apt update && sudo apt full-upgrade -y && sudo apt autoremove -y && mise self-update && mise upgrade'" >> ~/.bash_aliases
+source ~/.bashrc
+```
+
+Ubuntu's stock `.bashrc` sources `~/.bash_aliases` automatically, so nothing else is
+needed. Run `all-update` from any shell.
+
+After a npiperelay upgrade, restart the bridge in each open shell:
+
+```bash
+pkill -f 'UNIX-LISTEN:.*agent.sock' && rm -f ~/.ssh/agent.sock.* && exec bash
+```
+
+Or simply `wsl --shutdown` from PowerShell. The symlink target survives upgrades,
+because the winget package path is stable.
+
+---
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+| --- | --- | --- |
+| `bwrap: Can't create file at /etc/resolv.conf` | `/etc/resolv.conf` is a symlink | [Part 1.2](#12-fix-etcresolvconf-required-for-ai-jail) |
+| `bwrap: setting up uid map: Permission denied` | Ubuntu 24.04+ AppArmor blocks unprivileged user namespaces | `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (persist via `/etc/sysctl.d/`, needs systemd enabled in `wsl.conf`) |
+| `ssh-add -l` gives `Could not open a connection` | Relay not running, or Bitwarden locked / agent disabled | `exec bash`, then unlock Bitwarden Desktop |
+| `ssh-add -l` gives `agent has no identities` | Bridge works, no key in the agent | Add an SSH key item in Bitwarden |
+| `git@github.com: Permission denied (publickey)` | Key registered as Signing only | [Part 6.1](#61-register-the-key-on-github-twice) |
+| Commit shows **Unverified** on GitHub | Key not registered as a Signing key, or email mismatch | [Part 6.1](#61-register-the-key-on-github-twice) |
+| `gpg.ssh.allowedSignersFile needs to be configured` | Local verification not set up, signing itself is fine | [Part 6.3](#63-local-verification-optional) |
+| Claude Code asks to log in every run | `private_home = true` in `.ai-jail`, or `claude_dir` points at a directory that does not exist | `cat .ai-jail`, remove the offending line |
+| Distro stays running after closing all terminals | A detached process (old `setsid` relay, dev server, VS Code Server, Docker Desktop integration) | `ps -eo pid,etime,cmd --sort=-etime \| head`, then `wsl --shutdown` |
+| Bitwarden prompts on VS Code window focus | VS Code Git auto-fetch, not signing | `"git.autofetch": false` in `.vscode/settings.json` |
+
+---
+
+## Security notes
+
+### What the jail does protect
+
+Verified empirically from inside a running jail:
+
+- **Project-only persistent writes.** `$HOME` is tmpfs and discarded on exit
+- **`~/.ssh`, `~/.gnupg`, `~/.aws` never mounted**, hardcoded never-mount list
+- **No `/mnt`**, so the Windows filesystem and all Windows executables are unreachable
+- **PID namespace unshared**, so host processes are invisible and cannot be signalled
+- **Empty capability bounding set**, `NoNewPrivs=1`, every mount `nosuid`, so setuid
+  binaries are inert
+- **Around 40 syscalls blocked** by seccomp: the whole mount family, `ptrace`, `bpf`,
+  `unshare`/`setns`, `io_uring`, keyring, `kexec`, module loading
+- **Landlock LSM** enforced at VFS level, on top of the mount layout
+- **`~/.local` read-only**, so the ai-jail binary itself is out of reach and PATH
+  shadowing is blocked
+
+### What it does not protect
+
+- **Network egress is unfiltered.** bwrap does not unshare the network namespace, so
+  the agent shares the host's. Note that any allowlist must permit the Claude API
+  anyway, so egress filtering buys less than it appears to. `--lockdown
+  --allow-tcp-port 443` exists, but also makes the project read-only
+- **`~/.claude` is read-write** and cannot be hidden. It holds `.credentials.json`
+  (a live OAuth token) and supports hooks that run shell commands, which is a
+  persistence path into future *unjailed* sessions. `chattr +i ~/.claude/settings.json`
+  closes the hook path specifically, at the cost of needing `chattr -i` to change any
+  setting
+- **`/dev/shm` is bind-mounted from the host** at mode 1777, a bidirectional channel
+  outside Landlock's file rules by construction
+- **The agent can open listening ports.** Check occasionally from the host:
+  `ss -lptn | grep -v 127.0.0.1`
+- **No default credential denylist.** Every `mask` is operator-supplied. The threat
+  model is *contain the host blast radius*, not *keep secrets from the agent*
+- **Kernel escapes are out of scope**, per the author. For genuinely untrusted code,
+  use a disposable VM
+
+### Scope creep is not a security control
+
+The sandbox constrains *where* the agent can act, not *how much* it does. For bounding
+behaviour, use Claude Code's own permission system (`/permissions`, written to
+`.claude/settings.local.json`) and tighter prompts.
+
+---
+
+## Known upstream issues
+
+Both are WSL-specific and worth reporting to
+[akitaonrails/ai-jail](https://github.com/akitaonrails/ai-jail/issues):
+
+1. **`/etc/resolv.conf` symlink breaks startup.** ai-jail already binds
+   `/mnt/wsl/resolv.conf`, so it has some WSL awareness, but it does not handle
+   `/etc/resolv.conf` being a symlink to it.
+2. **`--display` exposes VS Code IPC sockets on WSL.** `XDG_RUNTIME_DIR` resolves to
+   `/mnt/wslg/runtime-dir`, where VS Code Server stores `vscode-ipc-*.sock` and
+   `vscode-git-*.sock`. This is a real sandbox-escape path, not just noise.
