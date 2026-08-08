@@ -21,6 +21,8 @@ not try to escape it.
   wait rather than touching it.
 - You may start dev servers and other processes when they help you check your work.
   Bind them to 127.0.0.1 only, never 0.0.0.0, since this machine is on a tailnet.
+- Stop anything you started once you are done with it. Nothing you launched should still
+  be running when you hand back to me. This applies only to your own processes.
 - I may have my own instance running in another shell on a common port such as 3000.
   Do not try to kill it, and pick a different port for yours. If a code change means my
   instance needs a restart, tell me and I will do it manually.

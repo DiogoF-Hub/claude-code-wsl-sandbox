@@ -650,9 +650,37 @@ flag with auto-save disabled so the session ID is not written into `.ai-jail`:
 ai-jail --no-save-config claude --resume 11f2b4c6-625a-4650-b0c2-96cf276f91f4
 ```
 
-Workflow: the agent edits inside the jail, you commit from a normal terminal. The jail
-does not forward `SSH_AUTH_SOCK` and does not mount `~/.ssh`, so commits from inside
-cannot be signed.
+Workflow: the agent edits inside the jail, you commit from a normal terminal.
+
+### Why commits happen outside the jail
+
+Two things are missing inside it. `user.signingkey` points at
+`~/.ssh/bitwarden_signing.pub`, and `~/.ssh` is never mounted, so that path does not
+exist. `SSH_AUTH_SOCK` is not forwarded either, so `ssh-keygen -Y sign` has nothing to
+talk to. Since `commit.gpgsign = true` comes from the read-only `.gitconfig`, a plain
+`git commit` in there fails outright. It can still commit unsigned with
+`--no-gpg-sign`, which is worth knowing: an unsigned commit appearing in your history is
+the signal that something happened inside the jail.
+
+That is why [`CLAUDE.md`](CLAUDE.md) asks for a block of `git add` and `git commit`
+commands rather than commits. The agent does the useful part, grouping changes and
+writing messages, and you run it outside so every commit is signed with your key.
+
+If you do want signing to work inside the jail:
+
+```bash
+ai-jail --ssh claude
+```
+
+That mounts `~/.ssh` read-only and forwards `SSH_AUTH_SOCK`, so `git commit` works and
+Bitwarden prompts for each signature.
+
+Think before enabling it. It gives the agent use of your agent socket, which means it
+can authenticate as you to any SSH host, not just sign commits. "Ask for authorization:
+Always" does prompt every time, but the dialog reads
+`npiperelay.exe is requesting access to github.com` whether the request came from you or
+from the agent, so you would be approving blind. Leaving it off keeps the split intact:
+the agent writes code, you commit, and every commit in your history is provably yours.
 
 ---
 
@@ -701,6 +729,8 @@ not try to escape it.
   wait rather than touching it.
 - You may start dev servers and other processes when they help you check your work.
   Bind them to 127.0.0.1 only, never 0.0.0.0, since this machine is on a tailnet.
+- Stop anything you started once you are done with it. Nothing you launched should still
+  be running when you hand back to me. This applies only to your own processes.
 - I may have my own instance running in another shell on a common port such as 3000.
   Do not try to kill it, and pick a different port for yours. If a code change means my
   instance needs a restart, tell me and I will do it manually.
@@ -732,25 +762,47 @@ not try to escape it.
   namespace, so it cannot prevent this.
 - **Running processes is allowed on purpose.** Checking your own work by starting a dev
   server is useful, and `--die-with-parent` plus the unshared PID namespace means
-  anything it starts dies with the jail. No orphans on the host.
+  anything it starts dies with the jail. No orphans on the host. The cleanup rule is
+  about the session rather than safety: a forgotten server holds its port for the rest
+  of the session, and the next thing that needs that port fails for no obvious reason.
 
 
 
 | What | Command |
 | --- | --- |
-| ai-jail, Node, system packages | `all-update` (alias below) |
+| Everything on the WSL side | `all-update` (alias below) |
 | npiperelay, everything Windows | `winget upgrade --all` |
-| Claude Code | self-updating |
 
 A single alias for the WSL side:
 
 ```bash
-echo "alias all-update='sudo apt update && sudo apt full-upgrade -y && sudo apt autoremove -y && mise self-update && mise upgrade'" >> ~/.bash_aliases
+echo "alias all-update='sudo apt update && sudo apt full-upgrade -y && sudo apt autoremove -y && mise self-update && mise upgrade && claude update'" >> ~/.bash_aliases
 source ~/.bashrc
 ```
 
 Ubuntu's stock `.bashrc` sources `~/.bash_aliases` automatically, so nothing else is
-needed. Run `all-update` from any shell.
+needed. Run `all-update` from any shell, outside the jail.
+
+`claude update` goes last on purpose. With `&&` chaining a failed step skips everything
+after it, so a hiccup in the Claude Code updater cannot block your system upgrades.
+
+### Claude Code cannot update itself inside the jail
+
+Native installations auto-update in the background, and `claude update` forces it
+immediately. Both write to the binary at `~/.local/bin/claude`, and the dry run shows
+that path mounted read-only:
+
+```
+--ro-bind /home/diogo/.local /home/diogo/.local
+```
+
+So the update fails inside the jail, silently or with a warning. This is deliberate
+rather than a gap: read-only `~/.local` is the same rule that keeps the ai-jail binary
+itself out of the agent's reach and blocks PATH shadowing.
+
+Run `claude` unjailed now and then, or let `all-update` handle it. `claude doctor`
+reports the result of the most recent update attempt, which is the quickest way to check
+a version that looks stale.
 
 After a npiperelay upgrade, restart the bridge in each open shell:
 
