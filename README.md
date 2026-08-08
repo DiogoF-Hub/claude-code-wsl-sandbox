@@ -373,15 +373,35 @@ git config --global gpg.format ssh
 git config --global user.signingkey "$HOME/.ssh/bitwarden_signing.pub"
 git config --global commit.gpgsign true
 
-# 4. Always use SSH for github.com, even when the URL is HTTPS
-git config --global url."git@github.com:".insteadOf "https://github.com/"
+# 4. Use SSH for your own repos, even when the URL is HTTPS
+git config --global url."git@github.com:<user>/".insteadOf "https://github.com/<user>/"
 ```
 
 Step 4 is worth setting. GitHub removed password authentication for HTTPS in 2021, so
 cloning an HTTPS URL prompts for a personal access token, which is a second credential
-to manage. The rewrite means you can paste any GitHub URL straight from the browser and
-it silently goes over SSH through the Bitwarden key. It applies to submodules and to any
-tool that shells out to git.
+to manage. The rewrite means you can paste one of your own GitHub URLs straight from the
+browser and it silently goes over SSH through the Bitwarden key. It applies to submodules
+and to any tool that shells out to git.
+
+**Scope it to your account rather than all of github.com.** The unscoped form,
+`url."git@github.com:".insteadOf "https://github.com/"`, forces *every* GitHub URL
+through your key, including public repos that any tool might clone in the background.
+Those clones then fail with `git@github.com: Permission denied (publickey)` whenever the
+subprocess does not inherit your agent socket, which is a confusing error for something
+that would have worked anonymously over HTTPS.
+
+Add a line per account or organisation you push to:
+
+```bash
+git config --global url."git@github.com:<org>/".insteadOf "https://github.com/<org>/"
+```
+
+Trailing slashes matter: without them the prefix would also match names that merely start
+with the same characters. Review what you have with:
+
+```bash
+git config --global --get-regexp 'url\..*\.insteadof'
+```
 
 For a repo already cloned over HTTPS, point it at SSH directly:
 
@@ -953,6 +973,7 @@ because the winget package path is stable.
 | `ssh-add -l` gives `agent has no identities` | Bridge works, no key in the agent | Add an SSH key item in Bitwarden |
 | `git@github.com: Permission denied (publickey)` | Key registered as Signing only | [Part 6.1](#61-register-the-key-on-github-twice) |
 | `Username for 'https://github.com':` prompt on clone | Remote is an HTTPS URL, and GitHub dropped password auth in 2021 | Clone the `git@github.com:` URL, or set the `insteadOf` rewrite in [Part 6.2](#62-git-config-in-wsl) |
+| `Permission denied (publickey)` when a tool clones a public repo | An unscoped `insteadOf` rewrote its HTTPS URL to SSH, and the subprocess has no agent socket | Scope the rewrite to your own account, see [Part 6.2](#62-git-config-in-wsl) |
 | Commit shows **Unverified** on GitHub | Key not registered as a Signing key, or email mismatch | [Part 6.1](#61-register-the-key-on-github-twice) |
 | `gpg.ssh.allowedSignersFile needs to be configured` | Local verification not set up, signing itself is fine | [Part 6.3](#63-local-verification-optional) |
 | Claude Code asks to log in every run | `private_home = true` in `.ai-jail`, or `claude_dir` points at a directory that does not exist | `cat .ai-jail`, remove the offending line |
