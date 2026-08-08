@@ -29,6 +29,14 @@ not **how much** it does. For bounding behaviour, see
 
 > Paths below assume the username `diogo` on both Windows and WSL. Adjust as needed.
 
+## What is in this repo
+
+- `README.md`, this guide
+- [`.ai-jail`](.ai-jail), my base sandbox config, see [Part 8](#part-8-the-ai-jail-config)
+- [`CLAUDE.md`](CLAUDE.md), the standing session instructions, see [Part 9](#part-9-session-instructions)
+
+Both files are meant to be copied and adapted, not used verbatim.
+
 ---
 
 ## Table of contents
@@ -43,9 +51,10 @@ not **how much** it does. For bounding behaviour, see
 8. [Part 6: Git signing in WSL](#part-6-git-signing-in-wsl)
 9. [Part 7: Git signing on Windows](#part-7-git-signing-on-windows)
 10. [Part 8: The .ai-jail config](#part-8-the-ai-jail-config)
-11. [Maintenance](#maintenance)
-12. [Troubleshooting](#troubleshooting)
-13. [Security notes](#security-notes)
+11. [Part 9: Session instructions](#part-9-session-instructions)
+12. [Maintenance](#maintenance)
+13. [Troubleshooting](#troubleshooting)
+14. [Security notes](#security-notes)
 
 ---
 
@@ -557,8 +566,8 @@ VS Code uses the global Git config, so nothing extra to configure inside it.
 
 ### My base template
 
-This is the config I start from for every project. Commit it so the policy syncs across
-machines.
+This is the config I start from for every project, kept in this repo as
+[`.ai-jail`](.ai-jail). Commit it in each project so the policy syncs across machines.
 
 ```toml
 # ai-jail sandbox configuration
@@ -647,7 +656,85 @@ cannot be signed.
 
 ---
 
-## Maintenance
+## Part 9: Session instructions
+
+The sandbox constrains what the agent *can* reach. `CLAUDE.md` covers what it *should*
+do inside those limits, so the same instructions do not have to be retyped every session.
+Claude Code reads it automatically at the start of every session.
+
+Two locations, both read together:
+
+- `~/.claude/CLAUDE.md`, global, applies to every project in the distro
+- `./CLAUDE.md` at a project root, for anything specific to that repo
+
+Since this whole setup lives in one WSL distro and every project runs jailed, the global
+file is the right home for the sandbox rules:
+
+```bash
+mkdir -p ~/.claude
+nano ~/.claude/CLAUDE.md
+```
+
+The copy in this repo is [`CLAUDE.md`](CLAUDE.md):
+
+```markdown
+# Environment
+
+You are running inside an ai-jail sandbox (bubblewrap + Landlock + seccomp) on WSL 2.
+This is deliberate and expected.
+
+Only the current project directory is writable and persistent. $HOME is tmpfs and is
+discarded on exit, ~/.ssh is usually not mounted, and there is no /mnt, so Windows is
+unreachable.
+
+Why: the sandbox keeps work scoped to the project I asked about. It is not a statement
+that you are untrusted. Everything outside the project is out of scope by design, so do
+not try to escape it.
+
+## Rules
+
+- Do not try to work around the sandbox. If something fails because a path, socket or
+  binary is missing, stop and tell me what you needed and why. I will decide whether to
+  grant it.
+- Files inside the working directory are yours to change as needed, and so is ~/.claude.
+  Anything else outside the project, including my system, is off limits: mention it and
+  wait rather than touching it.
+- You may start dev servers and other processes when they help you check your work.
+  Bind them to 127.0.0.1 only, never 0.0.0.0, since this machine is on a tailnet.
+- I may have my own instance running in another shell on a common port such as 3000.
+  Do not try to kill it, and pick a different port for yours. If a code change means my
+  instance needs a restart, tell me and I will do it manually.
+- Do not commit by default, even if ~/.ssh turns out to be mounted and signing would
+  work. I want to review changes before they enter history.
+- When changes are ready, output one bash block of `git add` and `git commit` commands
+  with the messages written, then stop. Do not run it. I run it outside the jail so the
+  commits are signed with my key.
+- Judge the number of commits per case. Split into several when the changes are
+  genuinely separate concerns, and use a single commit when that is all the work
+  amounts to. Do not split for the sake of splitting.
+- The exception: if I explicitly ask you to commit during a session, and ~/.ssh is
+  mounted, go ahead. I will approve each signature in Bitwarden.
+```
+
+### Why it is worded this way
+
+- **Explaining that the sandbox is intentional matters more than it looks.** An agent
+  that hits a missing path with no context reads it as a broken environment and starts
+  working around it. Told the restriction is deliberate, it reports the problem instead,
+  which is what you want.
+- **The commit rules implement the review split.** The agent is good at grouping changes
+  and writing messages, which is the tedious part. Producing a command block rather than
+  running it means you see every message before it exists, and every commit in the repo
+  history is signed with your key.
+- **The 127.0.0.1 rule exists because of a real incident.** An agent bound a dev server
+  to `0.0.0.0`, exposing an endpoint that leaked the username, hostname and network
+  interfaces to the LAN and the tailnet. The sandbox does not unshare the network
+  namespace, so it cannot prevent this.
+- **Running processes is allowed on purpose.** Checking your own work by starting a dev
+  server is useful, and `--die-with-parent` plus the unshared PID namespace means
+  anything it starts dies with the jail. No orphans on the host.
+
+
 
 | What | Command |
 | --- | --- |
