@@ -775,7 +775,8 @@ not try to escape it.
 - Files inside the working directory are yours to change as needed. Anything else outside
   the project, including my system, is off limits: mention it and wait rather than
   touching it.
-- In `~/.claude` you may write your own auto-memory notes. Anything else there is mine
+- In `~/.claude` you may write your own auto-memory notes without asking. Record what is
+  true rather than how you worked around something missing. Anything else there is mine
   unless I have pointed you at it explicitly.
 - If a new notes or instruction file would help, propose it first: what it is for, what
   would go in it, and where it would be imported. Do not create the file, and do not add
