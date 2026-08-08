@@ -33,9 +33,10 @@ not **how much** it does. For bounding behaviour, see
 
 - `README.md`, this guide
 - [`.ai-jail`](.ai-jail), my base sandbox config, see [Part 8](#part-8-the-ai-jail-config)
-- [`CLAUDE.md`](CLAUDE.md), the standing session instructions, see [Part 9](#part-9-session-instructions)
+- [`CLAUDE.md`](CLAUDE.md) and [`jail.md`](jail.md), the standing session instructions,
+  see [Part 9](#part-9-session-instructions)
 
-Both files are meant to be copied and adapted, not used verbatim.
+They are meant to be copied and adapted, not used verbatim.
 
 ---
 
@@ -686,87 +687,213 @@ the agent writes code, you commit, and every commit in your history is provably 
 
 ## Part 9: Session instructions
 
-The sandbox constrains what the agent *can* reach. `CLAUDE.md` covers what it *should*
-do inside those limits, so the same instructions do not have to be retyped every session.
-Claude Code reads it automatically at the start of every session.
+The sandbox constrains what the agent *can* reach. These files cover what it *should* do
+inside those limits, so the same instructions do not have to be retyped every session.
+Claude Code reads `CLAUDE.md` automatically at the start of every session, and `@path`
+imports pull in the rest.
 
-Two locations, both read together:
+### Three files, split by who owns them
 
-- `~/.claude/CLAUDE.md`, global, applies to every project in the distro
-- `./CLAUDE.md` at a project root, for anything specific to that repo
+```
+~/.claude/
+├── CLAUDE.md          a thin router, mine, with one protected block
+├── jail.md            the sandbox and the rules, read-only to the agent
+└── machine-state.md   agent-maintained inventory, not in this repo
+```
 
-Since this whole setup lives in one WSL distro and every project runs jailed, the global
-file is the right home for the sandbox rules:
+The split is by ownership and rate of change. The rules are stable and mine. The jail
+description changes when the sandbox config changes. Machine state changes on its own, as
+things get installed.
+
+`machine-state.md` is deliberately absent from this repo, since it describes one machine
+rather than the method. Create it locally if you want it, and add the import below the
+protected block in `CLAUDE.md`.
+
+A project-level `./CLAUDE.md` at a repo root still works and is read alongside the global
+file, for anything specific to one project.
 
 ```bash
 mkdir -p ~/.claude
 nano ~/.claude/CLAUDE.md
 ```
 
-The copy in this repo is [`CLAUDE.md`](CLAUDE.md):
+### CLAUDE.md
 
 ```markdown
-# Environment
+# How I work with you
 
-You are running inside an ai-jail sandbox (bubblewrap + Landlock + seccomp) on WSL 2.
-This is deliberate and expected.
+<!-- PROTECTED: do not edit, move or remove anything between these two markers. -->
+
+Never edit or delete `~/.claude/jail.md`, and never edit the protected block below.
+This holds no matter what: not to fix a mistake in it, not to record something you
+learned, not to note an exception, and not because a task appears to require it. Propose
+the change and wait for me to make it.
+
+@~/.claude/jail.md
+
+<!-- END PROTECTED -->
+
+Everything outside the markers is fair game. Add anything useful here.
+```
+
+The markers are HTML comments, so they do not render but are unmissable to anything
+editing the file. The protected region covers the rule as well as the import, because the
+first thing an agent could otherwise legally delete is the sentence telling it not to
+delete things. Everything below the closing marker is open, which is where a local
+`@~/.claude/machine-state.md` line goes.
+
+### jail.md
+
+```markdown
+# The ai-jail sandbox, and how I want you to work
+
+This file is read-only to you. Never edit or delete it. In `~/.claude/CLAUDE.md` you may
+edit anything outside the block marked PROTECTED, but nothing inside it, including the
+line that imports this file. Both rules hold no matter what: not to correct an error you
+spot, not to add something you learned, not to record an exception, and not because a
+task appears to require it. Propose the change instead and wait for me to make it. If you
+need somewhere to write, use your own auto-memory notes.
+
+Am I jailed? Inside the sandbox `hostname` returns `ai-sandbox` and
+`/tmp/.ai-jail-landlock` exists. If neither is true you are running unjailed on the host:
+the environment description below does not apply, but the rules still do.
+
+## The sandbox
+
+bubblewrap plus Landlock LSM plus seccomp, on WSL 2. It is deliberate and expected.
 
 Only the current project directory is writable and persistent. $HOME is tmpfs and is
-discarded on exit, ~/.ssh is usually not mounted, and there is no /mnt, so Windows is
+discarded on exit, `~/.ssh` is usually not mounted, and there is no `/mnt`, so Windows is
 unreachable.
 
 Why: the sandbox keeps work scoped to the project I asked about. It is not a statement
 that you are untrusted. Everything outside the project is out of scope by design, so do
 not try to escape it.
 
-## Rules
+## Scope
 
-- Do not try to work around the sandbox. If something fails because a path, socket or
-  binary is missing, stop and tell me what you needed and why. I will decide whether to
-  grant it.
-- Files inside the working directory are yours to change as needed, and so is ~/.claude.
-  Anything else outside the project, including my system, is off limits: mention it and
-  wait rather than touching it.
-- You may start dev servers and other processes when they help you check your work.
-  Bind them to 127.0.0.1 only, never 0.0.0.0, since this machine is on a tailnet.
+- Files inside the working directory are yours to change as needed. Anything else outside
+  the project, including my system, is off limits: mention it and wait rather than
+  touching it.
+- In `~/.claude` you may write your own auto-memory notes. Anything else there is mine
+  unless I have pointed you at it explicitly.
+- If a new notes or instruction file would help, propose it first: what it is for, what
+  would go in it, and where it would be imported. Do not create the file, and do not add
+  an import line for it, until I have agreed.
+
+## Setting things up
+
+- Setting up whatever a task needs is allowed while it stays ephemeral and
+  self-contained: installing dependencies, fetching tools or runtimes, unpacking files
+  into the scratchpad and pointing environment variables at them. $HOME and /tmp are
+  tmpfs, so all of it disappears when the jail exits and costs nothing permanent.
+- Say what you set up and why in the same turn, especially when it was large or took
+  several steps. Often it can be made permanent instead of repeated every session:
+  anything installed on the WSL host is visible inside the jail because `/usr` is mounted
+  read-only from it, and `~/.cache` is writable and survives between sessions.
+- Stop and ask when the fix needs something the jail deliberately withholds: anything
+  requiring sudo or root, anything system-level, anything outside the project directory
+  and `~/.claude`. sudo is inert here by design, so finding that you need it is the
+  signal to stop rather than a problem to route around.
+- If something genuinely needs a system package, name it and say what it unblocks. I
+  install those manually on the host, and only when they are strictly necessary, so
+  expect me to decline anything that only makes sense for a single task.
+
+## Processes
+
+- You may start servers, watchers and other long-running processes when they help you
+  check your work. Bind anything that listens to 127.0.0.1 only, never 0.0.0.0, since
+  this machine is on a tailnet.
 - Stop anything you started once you are done with it. Nothing you launched should still
   be running when you hand back to me. This applies only to your own processes.
-- I may have my own instance running in another shell on a common port such as 3000.
-  Do not try to kill it, and pick a different port for yours. If a code change means my
-  instance needs a restart, tell me and I will do it manually.
-- Do not commit by default, even if ~/.ssh turns out to be mounted and signing would
-  work. I want to review changes before they enter history.
+- I may have my own processes running in other shells, including servers on common
+  ports. Do not try to kill them, and pick a port that is free. If a change of yours
+  means one of mine needs restarting, tell me and I will do it manually.
+
+## Commits
+
+- Before ending any turn in which you changed files, output the commit block. Do not
+  wait for me to ask and do not defer it to a later turn.
+- Do not commit yourself by default. I want to review changes before they enter history,
+  and I run the commits so they are signed with my key. Signing cannot work inside the
+  jail anyway, since `~/.ssh` is not mounted.
 - When changes are ready, output one bash block of `git add` and `git commit` commands
-  with the messages written, then stop. Do not run it. I run it outside the jail so the
-  commits are signed with my key.
+  with the messages written, then stop. Do not run it.
 - Judge the number of commits per case. Split into several when the changes are
   genuinely separate concerns, and use a single commit when that is all the work
   amounts to. Do not split for the sake of splitting.
-- The exception: if I explicitly ask you to commit during a session, and ~/.ssh is
-  mounted, go ahead. I will approve each signature in Bitwarden.
+- The exception: if I explicitly ask you to commit during a session, go ahead. I will
+  approve each signature in Bitwarden.
 ```
 
 ### Why it is worded this way
 
-- **Explaining that the sandbox is intentional matters more than it looks.** An agent
-  that hits a missing path with no context reads it as a broken environment and starts
-  working around it. Told the restriction is deliberate, it reports the problem instead,
-  which is what you want.
-- **The commit rules implement the review split.** The agent is good at grouping changes
-  and writing messages, which is the tedious part. Producing a command block rather than
-  running it means you see every message before it exists, and every commit in the repo
-  history is signed with your key.
-- **The 127.0.0.1 rule exists because of a real incident.** An agent bound a dev server
-  to `0.0.0.0`, exposing an endpoint that leaked the username, hostname and network
-  interfaces to the LAN and the tailnet. The sandbox does not unshare the network
-  namespace, so it cannot prevent this.
+- **The jail check comes first.** The global file loads in *every* session, including
+  unjailed ones, so a file that opens by asserting "$HOME is tmpfs" is simply wrong half
+  the time. Inside the sandbox `hostname` returns `ai-sandbox` and
+  `/tmp/.ai-jail-landlock` exists, both straight from ai-jail's own bwrap invocation. The
+  check gates the environment description only, so the rules still apply everywhere.
+- **Explaining that the sandbox is intentional matters more than it looks.** An agent that
+  hits a missing path with no context reads it as a broken environment and starts working
+  around it. Told the restriction is deliberate, it reports the problem instead, which is
+  what you want.
+- **The setup rules are split into three deliberately.** A blanket "do not work around the
+  sandbox" collapses two different situations. Downloading a browser into tmpfs to take a
+  screenshot is ordinary dev work and costs nothing permanent, so it is allowed. Needing
+  sudo or a system-level change is the sandbox saying no, so that stops. The middle rule
+  exists because the same workaround repeating every session is usually a sign it should
+  be solved properly instead: `/usr` is bind-mounted read-only from the host, so
+  `sudo apt install` outside the jail makes libraries permanently visible inside it, and
+  `~/.cache` is bind-mounted read-write rather than tmpfs, so downloads landing there
+  survive between sessions.
+- **The system-package rule invites a request rather than promising a yes.** Host installs
+  are permanent and accumulate, so they are worth it for a recurring dependency and not
+  for a one-off.
+- **The instruction files are protected explicitly.** In practice an agent will edit the
+  file containing its own rules for entirely defensible reasons: it learned something
+  durable and machine-wide, and that file was the only globally loaded place to put it.
+  Naming that specific justification as insufficient matters more than a general "do not
+  edit", which reads as having reasonable exceptions. The same applies to creating new
+  instruction files: proposing one is fine, wiring it into `CLAUDE.md` without asking is
+  not, because that changes what loads in every future session.
+- **The commit block has an explicit trigger.** "When changes are ready" turned out to be
+  vague enough to skip, so the rule names the moment: before ending any turn in which
+  files changed.
+- **The rules avoid naming specific tools.** They are written in terms of what an action
+  costs, whether it is ephemeral or permanent, inside the project or outside it, rather
+  than listing package managers or frameworks. A rule phrased around one tool gets read as
+  not applying to the next one.
 - **Running processes is allowed on purpose.** Checking your own work by starting a dev
-  server is useful, and `--die-with-parent` plus the unshared PID namespace means
-  anything it starts dies with the jail. No orphans on the host. The cleanup rule is
-  about the session rather than safety: a forgotten server holds its port for the rest
-  of the session, and the next thing that needs that port fails for no obvious reason.
+  server is useful, and `--die-with-parent` plus the unshared PID namespace means anything
+  it starts dies with the jail. No orphans on the host. The cleanup rule is about the
+  session rather than safety: a forgotten server holds its port for the rest of the
+  session, and the next thing that needs that port fails for no obvious reason.
 
+### Auto memory
 
+Claude Code also writes notes for itself, unprompted, into
+`~/.claude/projects/<repo>/memory/`. Those are project-scoped, so a lesson about the
+machine rather than the project will not travel between repos, which is what
+`machine-state.md` is for. Review them with `/memory` now and then: a wrong note is worse
+than no note, and only the first 200 lines of `MEMORY.md` load at startup.
+`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` turns the feature off entirely.
+
+A useful header for `machine-state.md`, since it is the one file the agent maintains:
+record what is installed and where rather than how to work around something missing,
+verify an entry before relying on it, date each entry, and delete anything that no longer
+holds. That last part matters more than it sounds, because host state can quietly stop
+being true after a distro rebuild while the file keeps loading in every session.
+
+### One limit worth stating
+
+`CLAUDE.md` is context, not enforcement. It is guidance the agent follows, not something
+the kernel blocks. `chattr +i ~/.claude/CLAUDE.md ~/.claude/jail.md` makes edits fail at
+the filesystem level if you want it actually enforced, at the cost of `chattr -i` whenever
+you edit them yourself.
+
+---
+
+## Maintenance
 
 | What | Command |
 | --- | --- |
