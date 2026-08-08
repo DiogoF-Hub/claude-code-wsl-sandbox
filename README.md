@@ -481,10 +481,10 @@ git config --global commit.gpgsign true
 git config --global gpg.ssh.program "C:/Windows/System32/OpenSSH/ssh-keygen.exe"
 ```
 
-Step 4 is the one that matters most. Git for Windows bundles its own MSYS2
-`ssh-keygen`, which expects a Unix socket and cannot reach a Windows named pipe, so
-signing fails silently or errors out. Pointing `gpg.ssh.program` at the *Windows*
-OpenSSH binary makes it talk to Bitwarden directly.
+The last line in that block is the one that matters most. Git for Windows bundles its
+own MSYS2 `ssh-keygen`, which expects a Unix socket and cannot reach a Windows named
+pipe, so signing fails silently or errors out. Pointing `gpg.ssh.program` at the
+*Windows* OpenSSH binary makes it talk to Bitwarden directly.
 
 Confirm the Git email matches a verified email on GitHub, otherwise commits sign but
 show as **Unverified**:
@@ -739,4 +739,4 @@ Both are WSL-specific and worth reporting to
 
 ## License
 
-[CC0 1.0 Universal](LICENSE). Public domain, no attribution required, though it is always appreciated.
+[CC0 1.0 Universal](https://github.com/DiogoF-Hub/claude-code-wsl-sandbox/blob/main/LICENSE). Public domain, no attribution required, though it is always appreciated.
