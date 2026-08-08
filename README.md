@@ -362,6 +362,22 @@ git config --global user.email "diogo@carvalhofer.lu"
 git config --global gpg.format ssh
 git config --global user.signingkey "$HOME/.ssh/bitwarden_signing.pub"
 git config --global commit.gpgsign true
+
+# 4. Always use SSH for github.com, even when the URL is HTTPS
+git config --global url."git@github.com:".insteadOf "https://github.com/"
+```
+
+Step 4 is worth setting. GitHub removed password authentication for HTTPS in 2021, so
+cloning an HTTPS URL prompts for a personal access token, which is a second credential
+to manage. The rewrite means you can paste any GitHub URL straight from the browser and
+it silently goes over SSH through the Bitwarden key. It applies to submodules and to any
+tool that shells out to git.
+
+For a repo already cloned over HTTPS, point it at SSH directly:
+
+```bash
+git remote set-url origin git@github.com:<user>/<repo>.git
+git remote -v
 ```
 
 Two settings that look contradictory but are not:
@@ -669,6 +685,7 @@ because the winget package path is stable.
 | `ssh-add -l` gives `Could not open a connection` | Relay not running, or Bitwarden locked / agent disabled | `exec bash`, then unlock Bitwarden Desktop |
 | `ssh-add -l` gives `agent has no identities` | Bridge works, no key in the agent | Add an SSH key item in Bitwarden |
 | `git@github.com: Permission denied (publickey)` | Key registered as Signing only | [Part 6.1](#61-register-the-key-on-github-twice) |
+| `Username for 'https://github.com':` prompt on clone | Remote is an HTTPS URL, and GitHub dropped password auth in 2021 | Clone the `git@github.com:` URL, or set the `insteadOf` rewrite in [Part 6.2](#62-git-config-in-wsl) |
 | Commit shows **Unverified** on GitHub | Key not registered as a Signing key, or email mismatch | [Part 6.1](#61-register-the-key-on-github-twice) |
 | `gpg.ssh.allowedSignersFile needs to be configured` | Local verification not set up, signing itself is fine | [Part 6.3](#63-local-verification-optional) |
 | Claude Code asks to log in every run | `private_home = true` in `.ai-jail`, or `claude_dir` points at a directory that does not exist | `cat .ai-jail`, remove the offending line |
