@@ -294,10 +294,20 @@ Append to `~/.bashrc`:
 
 ```bash
 # Bitwarden SSH agent bridge (per-shell; dies with this shell)
+# 1. Clear sockets whose owning shell no longer exists
+for s in "$HOME"/.ssh/agent.sock.*; do
+    [ -e "$s" ] || continue
+    pid="${s##*.}"
+    kill -0 "$pid" 2>/dev/null || { pkill -f "UNIX-LISTEN:$s," 2>/dev/null; rm -f "$s"; }
+done
+
+# 2. Start this shell's own relay
 export SSH_AUTH_SOCK="$HOME/.ssh/agent.sock.$$"
 socat UNIX-LISTEN:"$SSH_AUTH_SOCK",fork,unlink-early \
     EXEC:"npiperelay.exe -ei -s //./pipe/openssh-ssh-agent",nofork >/dev/null 2>&1 &
 SOCAT_PID=$!
+
+# 3. Tear it down when this shell exits
 trap 'kill $SOCAT_PID 2>/dev/null; rm -f "$SSH_AUTH_SOCK"' EXIT
 ```
 
@@ -306,17 +316,36 @@ Then verify:
 ```bash
 mkdir -p ~/.ssh && chmod 700 ~/.ssh
 exec bash
-ssh-add -l    # expect your key fingerprint
+ssh-add -l                    # expect your key fingerprint
+ls -la ~/.ssh/agent.sock.*    # expect exactly one, numbered for this shell
 ```
 
 Design notes:
 
 - **`.$$` suffix**: each shell gets its own socket, so two terminals never fight over
-  one path.
-- **`unlink-early`**: removes a stale socket file left by a crashed shell.
+  one path. It also makes the socket self-identifying, which is what the sweep relies on.
 - **`trap ... EXIT`**: kills the relay when the shell exits. No interactive guard is
   needed, because Ubuntu's stock `.bashrc` already returns early for non-interactive
   shells.
+- **The sweep exists because the trap is not guaranteed.** `EXIT` fires on a clean exit
+  or a SIGHUP, but not on SIGKILL. A terminal that is force-killed rather than closed
+  leaves its relay running with no parent, and one orphaned relay is enough to keep the
+  whole distro alive and defeat `vmIdleTimeout=0`. Since each socket is named after its
+  shell's PID, `kill -0` on that PID says whether the owner still exists, so opening any
+  new shell clears what the last killed one left behind.
+- **`unlink-early`**: removes a stale socket file if one is still sitting at the path.
+
+One known limit: the sweep matches sockets to shells by PID, so if a dead shell's PID has
+been reused by an unrelated process, that orphan survives one extra round. It clears on a
+later pass, and `wsl --shutdown` is always a hard reset.
+
+Check for strays at any time with:
+
+```bash
+ps -eo pid,etime,cmd --sort=-etime | grep [s]ocat
+```
+
+Anything older than your current session is an orphan.
 
 ### 5.4 Why the relay must die with the shell
 
