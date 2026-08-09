@@ -301,14 +301,13 @@ for s in "$HOME"/.ssh/agent.sock.*; do
     kill -0 "$pid" 2>/dev/null || { pkill -f "UNIX-LISTEN:$s," 2>/dev/null; rm -f "$s"; }
 done
 
-# 2. Start this shell's own relay
+# 2. Start the relay in its own session, so a stray Ctrl+C never reaches it
 export SSH_AUTH_SOCK="$HOME/.ssh/agent.sock.$$"
-socat UNIX-LISTEN:"$SSH_AUTH_SOCK",fork,unlink-early \
+setsid socat UNIX-LISTEN:"$SSH_AUTH_SOCK",fork,unlink-early \
     EXEC:"npiperelay.exe -ei -s //./pipe/openssh-ssh-agent",nofork >/dev/null 2>&1 &
-SOCAT_PID=$!
 
-# 3. Tear it down when this shell exits
-trap 'kill $SOCAT_PID 2>/dev/null; rm -f "$SSH_AUTH_SOCK"' EXIT
+# 3. Tear it down when this shell exits, matched by socket path rather than PID
+trap 'pkill -f "UNIX-LISTEN:$SSH_AUTH_SOCK," 2>/dev/null; rm -f "$SSH_AUTH_SOCK"' EXIT
 ```
 
 Then verify:
@@ -326,7 +325,14 @@ Design notes:
   one path. It also makes the socket self-identifying, which is what the sweep relies on.
 - **`trap ... EXIT`**: kills the relay when the shell exits. No interactive guard is
   needed, because Ubuntu's stock `.bashrc` already returns early for non-interactive
-  shells.
+  shells. It matches on the socket path rather than a stored PID, because `setsid` forks
+  and `$!` no longer points at socat.
+- **`setsid`**: puts the relay in its own session, so a stray Ctrl+C at the prompt cannot
+  reach it. Without this, one mistyped command kills your agent for that shell and
+  nothing tells you until a signature fails. Note that `trap '' INT` before `exec socat`
+  does *not* work: socat installs its own SIGINT handler at startup rather than checking
+  whether the signal is already ignored, so the inherited disposition is overwritten. The
+  signal has to not be delivered at all.
 - **The sweep exists because the trap is not guaranteed.** `EXIT` fires on a clean exit
   or a SIGHUP, but not on SIGKILL. A terminal that is force-killed rather than closed
   leaves its relay running with no parent, and one orphaned relay is enough to keep the
@@ -349,9 +355,10 @@ Anything older than your current session is an orphan.
 
 ### 5.4 Why the relay must die with the shell
 
-A detached relay (`setsid`) survives every terminal, which keeps the distro alive and
-silently defeats `vmIdleTimeout=0`. The per-shell version above lets the VM shut down
-once the last shell closes.
+`setsid` alone, with no teardown, leaves a relay running after every terminal closes,
+which keeps the distro alive and silently defeats `vmIdleTimeout=0`. That is why the
+block above pairs it with the EXIT trap: detached enough to survive Ctrl+C, still torn
+down when the shell exits, so the VM shuts down once the last one closes.
 
 Confirm with:
 
