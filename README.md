@@ -685,6 +685,29 @@ every time.
 | `hide_dotdirs` | `.azure` is bind-mounted from `C:\Users\...` and would expose CLI tokens if populated. `.vscode-server` is not needed by the agent. `.docker` and `.claude` cannot be hidden, ai-jail refuses because they are required. |
 | `mask` | Replaces matching files with empty ones. The whole project directory is readable, so secrets in-repo need masking explicitly. `--deny-path` throws a permission error instead of returning empty. |
 
+### The one flag that cannot be saved
+
+`--exec` is direct execution: no PTY proxy, no status bar. It is a runtime mode rather
+than sandbox policy, so `--init` silently drops it and there is no `.ai-jail` key for it.
+Every persistable option has a paired form (`--gpu / --no-gpu`, `--mise / --no-mise`);
+`--exec` has no `--no-exec` twin, which is the tell.
+
+If you want it every time, alias it:
+
+```bash
+echo "alias ai-jail='ai-jail --exec'" >> ~/.bash_aliases
+source ~/.bashrc
+```
+
+Bash does not recurse on an alias that invokes its own name, so this is safe. `.ai-jail`
+still supplies everything else, and `\ai-jail` bypasses the alias when you want the
+status bar back.
+
+`--exec` does not weaken the sandbox. It changes how output reaches your terminal, not
+what the sandboxed process can reach: the PTY proxy sits outside the bwrap boundary, and
+`--landlock-exec --landlock` is passed either way. What you lose is the status line that
+shows the jail is active, so use `hostname` instead, which returns `ai-sandbox` inside.
+
 ### Running it
 
 ```bash
@@ -950,7 +973,7 @@ you edit them yourself.
 | Everything on the WSL side | `all-update` (alias below) |
 | npiperelay, everything Windows | `winget upgrade --all` |
 
-A single alias for the WSL side:
+Aliases worth having, both in `~/.bash_aliases`:
 
 ```bash
 echo "alias all-update='sudo apt update && sudo apt full-upgrade -y && sudo apt autoremove -y && mise self-update && mise upgrade && claude update'" >> ~/.bash_aliases
@@ -958,7 +981,8 @@ source ~/.bashrc
 ```
 
 Ubuntu's stock `.bashrc` sources `~/.bash_aliases` automatically, so nothing else is
-needed. Run `all-update` from any shell, outside the jail.
+needed. Run `all-update` from any shell, outside the jail. The `ai-jail` alias is covered
+in [Part 8](#the-one-flag-that-cannot-be-saved).
 
 `claude update` goes last on purpose. With `&&` chaining a failed step skips everything
 after it, so a hiccup in the Claude Code updater cannot block your system upgrades.
@@ -1006,7 +1030,7 @@ because the winget package path is stable.
 | Commit shows **Unverified** on GitHub | Key not registered as a Signing key, or email mismatch | [Part 6.1](#61-register-the-key-on-github-twice) |
 | `gpg.ssh.allowedSignersFile needs to be configured` | Local verification not set up, signing itself is fine | [Part 6.3](#63-local-verification-optional) |
 | Claude Code asks to log in every run | `private_home = true` in `.ai-jail`, or `claude_dir` points at a directory that does not exist | `cat .ai-jail`, remove the offending line |
-| Distro stays running after closing all terminals | A detached process (old `setsid` relay, dev server, VS Code Server, Docker Desktop integration) | `ps -eo pid,etime,cmd --sort=-etime \| head`, then `wsl --shutdown` |
+| Distro stays running after closing all terminals | A detached process: an orphaned relay from a force-killed shell, a dev server, VS Code Server, or Docker Desktop integration | `ps -eo pid,etime,cmd --sort=-etime \| head` to find what is old, then `wsl --shutdown`. The sweep in [Part 5.3](#53-the-bashrc-block) clears orphaned relays on the next shell |
 | Bitwarden prompts on VS Code window focus | VS Code Git auto-fetch, not signing | `"git.autofetch": false` in `.vscode/settings.json` |
 
 ---
