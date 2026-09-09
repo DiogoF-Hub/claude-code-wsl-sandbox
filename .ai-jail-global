@@ -1,0 +1,12 @@
+# ai-jail sandbox configuration in home folder: ~/.ai-jail
+# https://github.com/akitaonrails/ai-jail
+# Edit freely. Regenerate with: ai-jail --clean --init
+
+no_status_bar = true
+
+[commands.claude]
+network = true
+agent_state = true
+terminal_passthrough = true
+rw_maps = ["~/.cache"]
+ro_maps = ["~/.config/mise", "~/.local/share/mise"]

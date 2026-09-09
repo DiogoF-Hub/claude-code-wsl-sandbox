@@ -32,7 +32,9 @@ not **how much** it does. For bounding behaviour, see
 ## What is in this repo
 
 - `README.md`, this guide
-- [`.ai-jail`](.ai-jail), my base sandbox config, see [Part 8](#part-8-the-ai-jail-config)
+- [`.ai-jail`](.ai-jail), my per-project sandbox config, and
+  [`.ai-jail-global`](.ai-jail-global), which belongs at `~/.ai-jail`. See
+  [Part 8](#part-8-the-ai-jail-config)
 - [`CLAUDE.md`](CLAUDE.md) and [`jail.md`](jail.md), the standing session instructions,
   see [Part 9](#part-9-session-instructions)
 
@@ -621,10 +623,79 @@ VS Code uses the global Git config, so nothing extra to configure inside it.
 
 ## Part 8: The .ai-jail config
 
-### My base template
+Written against **ai-jail 1.20.x**. Earlier versions had permissive defaults and a
+project config that could grant capabilities, so a guide written for those is now wrong
+in both directions. Check with `ai-jail --version`.
 
-This is the config I start from for every project, kept in this repo as
-[`.ai-jail`](.ai-jail). Commit it in each project so the policy syncs across machines.
+### Two files, and only one of them is trusted
+
+| File | Authority |
+| --- | --- |
+| `./.ai-jail` (project) | **Untrusted and monotonic.** It may tighten the sandbox but can never enable a capability. Setting `network = true` here does nothing. |
+| `~/.ai-jail` (global) | **Trusted.** A base table plus optional `[commands.<name>]` tables keyed by the first word of the command. |
+| CLI flags | Highest authority. |
+
+This is the single most important thing to internalise. A capability line in a project
+file is silently ignored, so the file looks like it is doing something it is not. If a
+setting is not taking effect, that asymmetry is the first thing to check.
+
+To let specific checkouts ship their own capability opt-ins, list their parent directory
+under `trust_project_config` in the global config. Keep that list narrow: everything at
+or beneath a listed directory is trusted, including repositories cloned there later.
+
+### The defaults are secure now
+
+Off unless you ask: network, GPU, display, X11, host `/dev/shm`, terminal passthrough,
+linked worktree metadata, Docker, SSH, Tailscale, the systemd user bus, and the status
+bar's update check.
+
+Two that catch people out:
+
+- **Private home is on by default.** `$HOME` is a fresh tmpfs. Nothing under it is
+  mounted unless you map it, which means no `~/.cache` and no mise toolchain.
+- **Agent credential state is not mounted.** `~/.claude` and `~/.claude.json` need
+  `--agent-state`, or Claude Code asks for a fresh login every launch and has no session
+  history.
+
+The environment is a minimal allowlist too, not your shell environment. Extend it with
+`--env NAME`, or `env_pass` in the global config.
+
+### My global config
+
+Kept in this repo as [`.ai-jail-global`](.ai-jail-global), because a dotfile named
+`.ai-jail` at the repo root would be the project config. Copy it to `~/.ai-jail`:
+
+```bash
+cp .ai-jail-global ~/.ai-jail
+```
+
+```toml
+# ai-jail sandbox configuration in home folder: ~/.ai-jail
+# https://github.com/akitaonrails/ai-jail
+# Edit freely. Regenerate with: ai-jail --clean --init
+
+no_status_bar = true
+
+[commands.claude]
+network = true
+agent_state = true
+terminal_passthrough = true
+rw_maps = ["~/.cache"]
+ro_maps = ["~/.config/mise", "~/.local/share/mise"]
+```
+
+| Line | Why |
+| --- | --- |
+| `network = true` | Claude Code cannot reach the API without it. Note what you are granting: unrestricted egress, so anything readable in the sandbox can leave. |
+| `agent_state = true` | Mounts `~/.claude` and `~/.claude.json`, so the login and session history persist. The trade is real: that directory holds a live OAuth token and supports hooks that run shell commands, and everything in the sandbox can reach it. |
+| `terminal_passthrough = true` | Output is filtered through a VT parser by default, which breaks full-screen TUI rendering. Raw forwarding fixes it and exposes the terminal's clipboard, query and parser surface. |
+| `rw_maps = ["~/.cache"]` | Restores caches that private home would otherwise discard, Playwright browsers among them. |
+| `ro_maps = [mise config, mise installs]` | mise needs both: the config says which versions are active, the installs hold the binaries. With neither present, ai-jail skips activation entirely. |
+
+Both mise paths are read-only on purpose. The agent needs to run those tools, not
+install new ones.
+
+### My project template
 
 ```toml
 # ai-jail sandbox configuration
@@ -644,53 +715,51 @@ no_gpu = true
 no_display = true
 ```
 
-It gets adapted per project (extra masks for whatever secrets that repo actually holds),
-but this is the base.
+Everything here tightens, so it is honoured from an untrusted project file. It gets
+adapted per project with extra masks for whatever secrets that repo actually holds.
 
-### How to create it
+Note what is **not** here. Capabilities like `network` and `terminal_passthrough` are
+ignored in a project file, so writing them here would only mislead whoever reads it next.
+They belong in `~/.ai-jail`.
 
-Two ways, both fine:
+`no_gpu` and `no_display` are redundant against current defaults, but harmless, and they
+keep the file honest if a future version flips a default back.
 
-1. **Write the file by hand.** Copy the template above into `.ai-jail` at the project
-   root. Simplest and fully predictable.
-2. **Run the full command once with `--init`.** ai-jail parses the flags and writes them
-   in the correct format, then exits without launching anything:
+| Option | Why |
+| --- | --- |
+| `mask` | Replaces matching project files with empty placeholders. The project directory is writable by default, so in-repo secrets need masking explicitly. `deny_paths` makes them inaccessible instead of empty. |
+| `hide_dotdirs` | Largely moot under private home, since nothing from host `$HOME` is mounted anyway. Kept as belt and braces. |
+| `no_display` | Was load-bearing on WSL before 1.20, when display passthrough mounted all of `XDG_RUNTIME_DIR` and dragged in VS Code's IPC socket. That is fixed upstream: only the validated Wayland socket is mounted now. Claude Code is a TUI, so this costs nothing either way. |
+
+### Masks only cover files that already exist
+
+A literal path missing at launch, or a glob matching nothing, is skipped with a warning,
+and a file the agent creates later in the session is **not** covered. If you want the
+rule enforced, create the file first:
 
 ```bash
-cd ~/Projects/my-app
-ai-jail --no-gpu --no-display \
-    --hide-dotdir .azure --hide-dotdir .vscode-server \
-    --mask .env --mask .env.local \
-    --init claude
+touch .env .env.local
 ```
 
-Do **not** include `--resume` here. `--init` assumes a clean starting point, and there
-is nothing to resume yet.
-
-I prefer one of those two over letting the file build itself up from stray flags, for
-the reason below.
+An empty file is enough. Globs sidestep the problem for variants you have not thought of,
+so `mask = [".env", ".env.*", "*.pem"]` is worth considering over naming each file, as
+long as you quote the pattern so your shell does not expand it first.
 
 ### Auto-save gotcha
 
 `--save-config` is **on by default**: any flag passed on the command line is silently
-written into `.ai-jail` and applies to every later run. This includes
+written into the project `.ai-jail` and applies to every later run. This includes
 `claude --resume <id>`, which gets recorded as part of `command` and pins that session
-forever, and `--private-home`, which silently hides `~/.claude` and forces a fresh login
-every time.
+forever.
+
+It interacts badly with the trust model. Pass `--network` once, and auto-save writes
+`network = true` into the project file, where it is then ignored. The session works, the
+next one does not, and the config file appears to say otherwise.
 
 - Put ai-jail flags **before** the command, and avoid passing Claude's own flags after it
 - Use `--no-save-config` for anything experimental
 - Use `--init` to write a config deliberately
-- When ai-jail behaves oddly, `cat .ai-jail` first
-
-### What each option does
-
-| Option | Why |
-| --- | --- |
-| `no_display = true` | **The important one.** On WSL, `XDG_RUNTIME_DIR` resolves to `/mnt/wslg/runtime-dir`, where VS Code Server drops `vscode-ipc-*.sock`. Anything able to write to that socket can drive the host VS Code, opening files anywhere and spawning processes outside the jail. Display passthrough drags it in as collateral. Claude Code is a TUI, so nothing is lost. |
-| `no_gpu = true` | No `/dev/dxg`, `/dev/dri` or `/dev/nvidia*` under WSL, so GPU passthrough adds 9p/overlay mount surface for zero capability. |
-| `hide_dotdirs` | `.azure` is bind-mounted from `C:\Users\...` and would expose CLI tokens if populated. `.vscode-server` is not needed by the agent. `.docker` and `.claude` cannot be hidden, ai-jail refuses because they are required. |
-| `mask` | Replaces matching files with empty ones. The whole project directory is readable, so secrets in-repo need masking explicitly. `--deny-path` throws a permission error instead of returning empty. |
+- When ai-jail behaves oddly, `cat .ai-jail` first, then `cat ~/.ai-jail`
 
 ### The one flag that cannot be saved
 
@@ -714,6 +783,26 @@ status bar back.
 what the sandboxed process can reach: the PTY proxy sits outside the bwrap boundary, and
 `--landlock-exec --landlock` is passed either way. What you lose is the status line that
 shows the jail is active, so use `hostname` instead, which returns `ai-sandbox` inside.
+
+For the same reason, neither `--exec` nor `--terminal-passthrough` appears in
+`--dry-run` output. Both are outer-wrapper concerns that the landlock helper never sees,
+so their absence there is not evidence they are off.
+
+### How to create the files
+
+Write them by hand. `--init` works, and it formats keys correctly, but it silently drops
+what it cannot persist and it writes to the project file, which is the untrusted one.
+Hand-written is more predictable for a config this small.
+
+Verify what actually took, which is the part that matters:
+
+```bash
+ai-jail --dry-run claude | grep -E 'unshare-net|landlock-exec'
+```
+
+No `--unshare-net` means the network is on. The trailing arguments after
+`/tmp/.ai-jail-landlock` are the resolved policy: `--agent-state`, `--network`,
+`--private-home` and the rest appear there explicitly.
 
 ### Running it
 
@@ -1036,7 +1125,11 @@ because the winget package path is stable.
 | `Permission denied (publickey)` when a tool clones a public repo | An unscoped `insteadOf` rewrote its HTTPS URL to SSH, and the subprocess has no agent socket | Scope the rewrite to your own account, see [Part 6.2](#62-git-config-in-wsl) |
 | Commit shows **Unverified** on GitHub | Key not registered as a Signing key, or email mismatch | [Part 6.1](#61-register-the-key-on-github-twice) |
 | `gpg.ssh.allowedSignersFile needs to be configured` | Local verification not set up, signing itself is fine | [Part 6.3](#63-local-verification-optional) |
-| Claude Code asks to log in every run | `private_home = true` in `.ai-jail`, or `claude_dir` points at a directory that does not exist | `cat .ai-jail`, remove the offending line |
+| A capability set in the project `.ai-jail` has no effect | Project config is untrusted and can only tighten | Move it to `~/.ai-jail`, see [Part 8](#two-files-and-only-one-of-them-is-trusted) |
+| Claude Code cannot reach the API | Network is off by default since 1.20 | `network = true` under `[commands.claude]` in `~/.ai-jail` |
+| Claude Code renders inline instead of full screen | Output is filtered through a VT parser by default | `terminal_passthrough = true`, or the `--exec` alias in [Part 8](#the-one-flag-that-cannot-be-saved) |
+| mise tools missing inside the jail | Private home means neither mise config nor installs are mounted | `ro_maps` for both paths, see [Part 8](#my-global-config) |
+| Claude Code asks to log in every run | Agent state is not mounted by default since 1.20 | `agent_state = true` under `[commands.claude]` in `~/.ai-jail` |
 | Distro stays running after closing all terminals | A detached process: an orphaned relay from a force-killed shell, a dev server, VS Code Server, or Docker Desktop integration | `ps -eo pid,etime,cmd --sort=-etime \| head` to find what is old, then `wsl --shutdown`. The sweep in [Part 5.3](#53-the-bashrc-block) clears orphaned relays on the next shell |
 | Bitwarden prompts on VS Code window focus | VS Code Git auto-fetch, not signing | `"git.autofetch": false` in `.vscode/settings.json` |
 
@@ -1048,8 +1141,10 @@ because the winget package path is stable.
 
 Verified empirically from inside a running jail:
 
-- **Project-only persistent writes.** `$HOME` is tmpfs and discarded on exit
-- **`~/.ssh`, `~/.gnupg`, `~/.aws` never mounted**, hardcoded never-mount list
+- **Project-only persistent writes.** Private home is the default, so `$HOME` is a fresh
+  tmpfs discarded on exit and nothing under host `$HOME` is mounted unless you map it
+- **`~/.ssh` needs `--ssh`**, off by default, so keys and the agent socket are out of
+  reach
 - **No `/mnt`**, so the Windows filesystem and all Windows executables are unreachable
 - **PID namespace unshared**, so host processes are invisible and cannot be signalled
 - **Empty capability bounding set**, `NoNewPrivs=1`, every mount `nosuid`, so setuid
@@ -1062,23 +1157,45 @@ Verified empirically from inside a running jail:
 
 ### What it does not protect
 
-- **Network egress is unfiltered.** bwrap does not unshare the network namespace, so
-  the agent shares the host's. Note that any allowlist must permit the Claude API
-  anyway, so egress filtering buys less than it appears to. `--lockdown
-  --allow-tcp-port 443` exists, but also makes the project read-only
-- **`~/.claude` is read-write** and cannot be hidden. It holds `.credentials.json`
-  (a live OAuth token) and supports hooks that run shell commands, which is a
-  persistence path into future *unjailed* sessions. `chattr +i ~/.claude/settings.json`
-  closes the hook path specifically, at the cost of needing `chattr -i` to change any
-  setting
-- **`/dev/shm` is bind-mounted from the host** at mode 1777, a bidirectional channel
-  outside Landlock's file rules by construction
-- **The agent can open listening ports.** Check occasionally from the host:
+- **Network egress is unfiltered when you enable it.** bwrap either unshares the network
+  namespace or does not; there is no middle ground. `--network` is all or nothing, and
+  Claude Code needs it, so anything readable in the sandbox can leave. `--allow-tcp-port`
+  is still accepted for compatibility but now fails closed, because UDP cannot be
+  constrained through it. `--lockdown` blocks network and makes the project read-only,
+  which suits review work rather than coding.
+- **`--agent-state` hands over a live credential.** `~/.claude` holds
+  `.credentials.json`, an OAuth token, and supports hooks that run shell commands, which
+  is a persistence path into future *unjailed* sessions. It is opt-in now, but Claude
+  Code is impractical without it. `chattr +i ~/.claude/settings.json` closes the hook
+  path specifically, at the cost of `chattr -i` whenever you change a setting.
+- **Every map you add is a hole you chose.** `rw_maps = ["~/.cache"]` is convenient and
+  low-value, but it is host state the agent can write. Audit the list occasionally rather
+  than letting it grow.
+- **The agent can open listening ports** once network is on. Check from the host:
   `ss -lptn | grep -v 127.0.0.1`
-- **No default credential denylist.** Every `mask` is operator-supplied. The threat
-  model is *contain the host blast radius*, not *keep secrets from the agent*
-- **Kernel escapes are out of scope**, per the author. For genuinely untrusted code,
-  use a disposable VM
+- **No default credential denylist.** Every `mask` is operator-supplied, and masks only
+  cover files that exist at launch. The threat model is *contain the host blast radius*,
+  not *keep secrets from the agent*.
+- **Kernel escapes are out of scope**, per the author. For genuinely untrusted code, use
+  a disposable VM.
+
+### What 1.20 fixed
+
+Three of these were findings from an earlier version of this guide, so they are worth
+recording as closed rather than deleted:
+
+- **Display no longer mounts all of `XDG_RUNTIME_DIR`.** Only the validated Wayland
+  socket is bound, and X11 moved behind a separate `--x11`. On WSL the old behaviour
+  pulled in `/mnt/wslg/runtime-dir` with VS Code Server's `vscode-ipc-*.sock`, which was
+  a real escape path: anything able to write that socket could drive the host editor and
+  spawn processes outside the jail.
+- **Host `/dev/shm` is off by default**, behind `--host-shm`. It used to be bind-mounted
+  at mode 1777, a bidirectional channel outside Landlock's file rules by construction.
+- **Agent credentials are no longer mounted by default.** `~/.claude` used to be
+  read-write with no way to hide it.
+
+Also new: the environment is a minimal allowlist rather than your shell's, and the status
+bar's version check no longer makes an outbound request unless you ask for it.
 
 ### Scope creep is not a security control
 
@@ -1090,15 +1207,29 @@ behaviour, use Claude Code's own permission system (`/permissions`, written to
 
 ## Known upstream issues
 
-Both are WSL-specific and worth reporting to
-[akitaonrails/ai-jail](https://github.com/akitaonrails/ai-jail/issues):
+Worth reporting to [akitaonrails/ai-jail](https://github.com/akitaonrails/ai-jail/issues)
+if they still reproduce on your version:
 
-1. **`/etc/resolv.conf` symlink breaks startup.** ai-jail already binds
+1. **`/etc/resolv.conf` symlink breaks startup on WSL.** ai-jail already binds
    `/mnt/wsl/resolv.conf`, so it has some WSL awareness, but it does not handle
-   `/etc/resolv.conf` being a symlink to it.
-2. **`--display` exposes VS Code IPC sockets on WSL.** `XDG_RUNTIME_DIR` resolves to
-   `/mnt/wslg/runtime-dir`, where VS Code Server stores `vscode-ipc-*.sock` and
-   `vscode-git-*.sock`. This is a real sandbox-escape path, not just noise.
+   `/etc/resolv.conf` being a symlink to it. Covered in
+   [Part 1.2](#12-fix-etcresolvconf-required-for-ai-jail).
+2. **TUI apps cannot use the alternate screen.** `--dev /dev` gives the sandbox a fresh
+   devpts instance, so the inherited pty has no node inside it: `isatty()` still passes
+   because the fd is a real pty, but `ttyname()` fails because there is nothing to name.
+   Applications that resolve their terminal by name fall back to inline rendering, which
+   leaves your shell scrollback interleaved with the session. Repro is two lines, `tty`
+   inside the jail versus outside. Not WSL-specific. `--rw-map /dev/pts` restores it at
+   the cost of letting the jail write into your other terminal sessions; `--exec` avoids
+   the PTY proxy instead and costs nothing.
+3. **`--init` silently drops flags it cannot persist**, `--exec` among them. It already
+   warns when a project config grants something your flags did not, so the mechanism for
+   saying something exists.
+
+**Fixed upstream**, both reported here against earlier versions: display passthrough
+mounting all of `XDG_RUNTIME_DIR` and exposing VS Code IPC sockets on WSL, and host
+`/dev/shm` being bind-mounted by default. See
+[What 1.20 fixed](#what-120-fixed).
 
 ---
 
