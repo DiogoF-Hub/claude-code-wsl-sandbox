@@ -747,33 +747,42 @@ long as you quote the pattern so your shell does not expand it first.
 
 ### Auto-save gotcha
 
-`--save-config` is **on by default**: any flag passed on the command line is silently
-written into the project `.ai-jail` and applies to every later run. This includes
-`claude --resume <id>`, which gets recorded as part of `command` and pins that session
-forever.
+`--save-config` is **on by default**: any ai-jail flag passed on the command line is
+silently written into the project `.ai-jail` and applies to every later run.
 
 It interacts badly with the trust model. Pass `--network` once, and auto-save writes
 `network = true` into the project file, where it is then ignored. The session works, the
 next one does not, and the config file appears to say otherwise.
+
+Arguments to the sandboxed command are no longer captured. On 1.20,
+`ai-jail claude --resume <id>` leaves `command = ["claude"]` untouched. Older versions
+recorded the whole line, which pinned that one session on every later bare run, so if you
+are on an earlier release check the file before assuming.
 
 - Put ai-jail flags **before** the command, and avoid passing Claude's own flags after it
 - Use `--no-save-config` for anything experimental
 - Use `--init` to write a config deliberately
 - When ai-jail behaves oddly, `cat .ai-jail` first, then `cat ~/.ai-jail`
 
-### The one flag that cannot be saved
+### The flags that live in an alias
 
 `--exec` is direct execution: no PTY proxy, no status bar. It is a runtime mode rather
 than sandbox policy, so `--init` silently drops it and there is no `.ai-jail` key for it.
 Every persistable option has a paired form (`--gpu / --no-gpu`, `--mise / --no-mise`);
 `--exec` has no `--no-exec` twin, which is the tell.
 
-If you want it every time, alias it:
+Both it and `--terminal-passthrough` are what I actually need for Claude Code to render
+full screen rather than inline, so they go in an alias:
 
 ```bash
-echo "alias ai-jail='ai-jail --exec'" >> ~/.bash_aliases
+echo "alias ai-jail='ai-jail --exec --terminal-passthrough'" >> ~/.bash_aliases
 source ~/.bashrc
 ```
+
+`terminal_passthrough = true` is in my global config as well, and in practice the flag is
+still needed on the command line. Both are outer-wrapper concerns rather than sandbox
+policy, which is the likely reason: neither reaches the part of ai-jail the config
+governs. Worth retesting after an upgrade rather than assuming.
 
 Bash does not recurse on an alias that invokes its own name, so this is safe. `.ai-jail`
 still supplies everything else, and `\ai-jail` bypasses the alias when you want the
@@ -812,11 +821,11 @@ ai-jail --dry-run claude    # inspect the mount plan
 ai-jail claude              # run for real
 ```
 
-To resume a previous session, either use `/resume` from inside Claude Code, or pass the
-flag with auto-save disabled so the session ID is not written into `.ai-jail`:
+To resume a previous session, pass the flag through or use `/resume` from inside Claude
+Code. On 1.20 the session ID is not written into `.ai-jail`, so this is safe to repeat:
 
 ```bash
-ai-jail --no-save-config claude --resume 11f2b4c6-625a-4650-b0c2-96cf276f91f4
+ai-jail claude --resume 11f2b4c6-625a-4650-b0c2-96cf276f91f4
 ```
 
 Workflow: the agent edits inside the jail, you commit from a normal terminal.
@@ -1078,7 +1087,7 @@ source ~/.bashrc
 
 Ubuntu's stock `.bashrc` sources `~/.bash_aliases` automatically, so nothing else is
 needed. Run `all-update` from any shell, outside the jail. The `ai-jail` alias is covered
-in [Part 8](#the-one-flag-that-cannot-be-saved).
+in [Part 8](#the-flags-that-live-in-an-alias).
 
 `claude update` goes last on purpose. With `&&` chaining a failed step skips everything
 after it, so a hiccup in the Claude Code updater cannot block your system upgrades.
@@ -1127,7 +1136,7 @@ because the winget package path is stable.
 | `gpg.ssh.allowedSignersFile needs to be configured` | Local verification not set up, signing itself is fine | [Part 6.3](#63-local-verification-optional) |
 | A capability set in the project `.ai-jail` has no effect | Project config is untrusted and can only tighten | Move it to `~/.ai-jail`, see [Part 8](#two-files-and-only-one-of-them-is-trusted) |
 | Claude Code cannot reach the API | Network is off by default since 1.20 | `network = true` under `[commands.claude]` in `~/.ai-jail` |
-| Claude Code renders inline instead of full screen | Output is filtered through a VT parser by default | `terminal_passthrough = true`, or the `--exec` alias in [Part 8](#the-one-flag-that-cannot-be-saved) |
+| Claude Code renders inline instead of full screen | Output is filtered through a VT parser by default | `terminal_passthrough = true`, or the `--exec` alias in [Part 8](#the-flags-that-live-in-an-alias) |
 | mise tools missing inside the jail | Private home means neither mise config nor installs are mounted | `ro_maps` for both paths, see [Part 8](#my-global-config) |
 | Claude Code asks to log in every run | Agent state is not mounted by default since 1.20 | `agent_state = true` under `[commands.claude]` in `~/.ai-jail` |
 | Distro stays running after closing all terminals | A detached process: an orphaned relay from a force-killed shell, a dev server, VS Code Server, or Docker Desktop integration | `ps -eo pid,etime,cmd --sort=-etime \| head` to find what is old, then `wsl --shutdown`. The sweep in [Part 5.3](#53-the-bashrc-block) clears orphaned relays on the next shell |
