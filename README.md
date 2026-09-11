@@ -132,20 +132,30 @@ bwrap: Can't create file at /etc/resolv.conf: No such file or directory
 ```
 
 The fix is to make it a regular file with the same contents. First, note your current
-nameserver and search domain:
+nameserver and search domain, and check whether you already have a `wsl.conf`:
 
 ```bash
 cat /etc/resolv.conf
+cat /etc/wsl.conf 2>/dev/null || echo "no /etc/wsl.conf yet"
 ```
 
-Then:
+Then **append** the network section:
 
 ```bash
-sudo tee /etc/wsl.conf > /dev/null << 'EOF'
+sudo tee -a /etc/wsl.conf > /dev/null << 'EOF'
+
 [network]
 generateResolvConf = false
 EOF
+
+# 1. Expect any existing sections, plus the new one
+cat /etc/wsl.conf
 ```
+
+> Append, do not overwrite. A stock distro has no `/etc/wsl.conf`, so a plain `tee` looks
+> fine, but the moment you have enabled systemd or set a default user the file exists and
+> `tee` replaces it without a word. Losing `[user] default=` in particular is confusing to
+> diagnose, because the next shell simply opens as root.
 
 Shut down from PowerShell so `wsl.conf` takes effect **before** writing the file:
 
@@ -273,8 +283,21 @@ winget install albertony.npiperelay
 where.exe npiperelay
 ```
 
-Open a **new** PowerShell window before running `where.exe`, because the PATH change
-does not reach already-running terminals.
+Open a **new** PowerShell window before running `where.exe`, because the PATH change does
+not reach already-running terminals.
+
+It reports the WinGet **Links** path rather than the package folder:
+
+```
+C:\Users\diogo\AppData\Local\Microsoft\WinGet\Links\npiperelay.exe
+```
+
+That is a real NTFS symlink to the binary under `WinGet\Packages`, not a wrapper script,
+so WSL resolves it through DrvFS normally and it is the path to use in 5.2. Confirm with:
+
+```powershell
+Get-Item "$env:LOCALAPPDATA\Microsoft\WinGet\Links\npiperelay.exe" | Select-Object LinkType, Target
+```
 
 ### 5.2 Symlink it into WSL
 
@@ -282,13 +305,15 @@ Symlinking rather than copying means `winget upgrade` maintains the binary and t
 bridge follows automatically:
 
 ```bash
-sudo ln -s "/mnt/c/Users/diogo/AppData/Local/Microsoft/WinGet/Packages/albertony.npiperelay_Microsoft.Winget.Source_8wekyb3d8bbwe/npiperelay.exe" \
+sudo ln -s "/mnt/c/Users/diogo/AppData/Local/Microsoft/WinGet/Links/npiperelay.exe" \
     /usr/local/bin/npiperelay.exe
 
 /usr/local/bin/npiperelay.exe    # expect the usage text
 ```
 
-Adjust the path to whatever `where.exe npiperelay` reported.
+Adjust the path to whatever `where.exe npiperelay` reported. The `Packages` path works
+just as well, but it carries a source hash in the folder name and buys nothing: both are
+maintained by `winget upgrade`.
 
 ### 5.3 The `.bashrc` block
 
@@ -367,6 +392,10 @@ Confirm with:
 ```powershell
 wsl --list --running    # expect "There are no running distributions"
 ```
+
+Give it a minute. The relay dies with its shell immediately, but VS Code Server lingers
+after its window closes, so the distro can stay listed for a minute or two before the VM
+actually shuts down. A distro still listed after that is a genuine straggler.
 
 Known trade-off: VS Code captures `SSH_AUTH_SOCK` once when it resolves the shell
 environment, so the **git panel** may end up with a dead socket path. The **integrated
@@ -713,14 +742,15 @@ mask = [
 ]
 no_gpu = true
 no_display = true
+terminal_passthrough = true
 ```
 
-Everything here tightens, so it is honoured from an untrusted project file. It gets
-adapted per project with extra masks for whatever secrets that repo actually holds.
+Everything here either tightens or is inert, so it is honoured from an untrusted project
+file. It gets adapted per project with extra masks for whatever secrets that repo actually
+holds.
 
-Note what is **not** here. Capabilities like `network` and `terminal_passthrough` are
-ignored in a project file, so writing them here would only mislead whoever reads it next.
-They belong in `~/.ai-jail`.
+Note what is **not** here. Capabilities like `network` are ignored in a project file, so
+writing them here would only mislead whoever reads it next. They belong in `~/.ai-jail`.
 
 `no_gpu` and `no_display` are redundant against current defaults, but harmless, and they
 keep the file honest if a future version flips a default back.
@@ -776,13 +806,26 @@ full screen rather than inline, so they go in an alias:
 
 ```bash
 echo "alias ai-jail='ai-jail --exec --terminal-passthrough'" >> ~/.bash_aliases
-source ~/.bashrc
+source ~/.bash_aliases
 ```
 
-`terminal_passthrough = true` is in my global config as well, and in practice the flag is
-still needed on the command line. Both are outer-wrapper concerns rather than sandbox
-policy, which is the likely reason: neither reaches the part of ai-jail the config
-governs. Worth retesting after an upgrade rather than assuming.
+> Source `~/.bash_aliases`, not `~/.bashrc`. Re-sourcing `.bashrc` in a live shell runs the
+> bridge block from [Part 5.3](#53-the-bashrc-block) a second time, so a second socat binds
+> the same socket path while the first keeps running. The EXIT trap does clear both, since
+> it matches on the path rather than a PID, but you carry a duplicate relay until the shell
+> closes. Ubuntu's stock `.bashrc` sources `~/.bash_aliases` on every new shell anyway.
+
+`--terminal-passthrough` is in the alias because `--exec` needs it. 1.20 refuses `--exec`
+on a TTY without it, so the two travel together rather than being two independent
+preferences. `terminal_passthrough = true` is in my global config as well and the flag is
+*still* required on the command line, because `--exec` is an outer-wrapper concern that
+never reaches the part of ai-jail the config governs. Worth retesting after an upgrade
+rather than assuming.
+
+The two flags differ for auto-save, though. `--exec` has no config key and is dropped,
+while `terminal_passthrough` has one and gets written into the project `.ai-jail` on the
+first run, which is why it appears in the template above. Use `--no-save-config` in the
+alias if you would rather it did not.
 
 Bash does not recurse on an alias that invokes its own name, so this is safe. `.ai-jail`
 still supplies everything else, and `\ai-jail` bypasses the alias when you want the
@@ -820,6 +863,18 @@ cd ~/Projects/my-app
 ai-jail --dry-run claude    # inspect the mount plan
 ai-jail claude              # run for real
 ```
+
+> **Always name the command.** Bare `ai-jail` takes it from `command = ["claude"]` in the
+> project file, and the global `[commands.claude]` table is keyed on the command as given
+> on the *command line*, so it never matches. Every capability silently reverts to the
+> default: no network, no agent state, no mise maps. It surfaces as
+> `Failed to connect to api.anthropic.com: EAI_AGAIN`, which reads like a DNS problem
+> rather than a config one. The difference is visible in the dry run:
+>
+> ```bash
+> ai-jail --dry-run | grep -c unshare-net          # 1, network unshared
+> ai-jail --dry-run claude | grep -c unshare-net    # 0, table matched
+> ```
 
 To resume a previous session, pass the flag through or use `/resume` from inside Claude
 Code. On 1.20 the session ID is not written into `.ai-jail`, so this is safe to repeat:
@@ -1082,11 +1137,12 @@ Aliases worth having, both in `~/.bash_aliases`:
 
 ```bash
 echo "alias all-update='sudo apt update && sudo apt full-upgrade -y && sudo apt autoremove -y && mise self-update && mise upgrade && claude update'" >> ~/.bash_aliases
-source ~/.bashrc
+source ~/.bash_aliases
 ```
 
 Ubuntu's stock `.bashrc` sources `~/.bash_aliases` automatically, so nothing else is
-needed. Run `all-update` from any shell, outside the jail. The `ai-jail` alias is covered
+needed, and sourcing that file rather than `.bashrc` avoids starting a duplicate SSH relay
+in the current shell. Run `all-update` from any shell, outside the jail. The `ai-jail` alias is covered
 in [Part 8](#the-flags-that-live-in-an-alias).
 
 `claude update` goes last on purpose. With `&&` chaining a failed step skips everything
@@ -1126,7 +1182,8 @@ because the winget package path is stable.
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | `bwrap: Can't create file at /etc/resolv.conf` | `/etc/resolv.conf` is a symlink | [Part 1.2](#12-fix-etcresolvconf-required-for-ai-jail) |
-| `bwrap: setting up uid map: Permission denied` | Ubuntu 24.04+ AppArmor blocks unprivileged user namespaces | `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (persist via `/etc/sysctl.d/`, needs systemd enabled in `wsl.conf`) |
+| `bwrap: setting up uid map: Permission denied` | Ubuntu 24.04+ AppArmor blocks unprivileged user namespaces | `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0` (persist via `/etc/sysctl.d/`, needs systemd enabled in `wsl.conf`). Note this re-enables unprivileged user namespaces distro-wide, not just for ai-jail |
+| `sysctl: cannot stat /proc/sys/kernel/apparmor_restrict_unprivileged_userns` | Not a fault. The WSL kernel does not build that restriction, so the knob does not exist and bwrap works out of the box | Nothing to do. Confirm with `bwrap --unshare-user --unshare-pid --ro-bind / / true`. If bwrap fails anyway, the cause is something else |
 | `ssh-add -l` gives `Could not open a connection` | Relay not running, or Bitwarden locked / agent disabled | `exec bash`, then unlock Bitwarden Desktop |
 | `ssh-add -l` gives `agent has no identities` | Bridge works, no key in the agent | Add an SSH key item in Bitwarden |
 | `git@github.com: Permission denied (publickey)` | Key registered as Signing only | [Part 6.1](#61-register-the-key-on-github-twice) |
@@ -1136,6 +1193,8 @@ because the winget package path is stable.
 | `gpg.ssh.allowedSignersFile needs to be configured` | Local verification not set up, signing itself is fine | [Part 6.3](#63-local-verification-optional) |
 | A capability set in the project `.ai-jail` has no effect | Project config is untrusted and can only tighten | Move it to `~/.ai-jail`, see [Part 8](#two-files-and-only-one-of-them-is-trusted) |
 | Claude Code cannot reach the API | Network is off by default since 1.20 | `network = true` under `[commands.claude]` in `~/.ai-jail` |
+| `Failed to connect to api.anthropic.com: EAI_AGAIN` even though `network = true` is set | Launched as bare `ai-jail`, so the command came from `command = [...]` in the project file and the global `[commands.<name>]` table never matched. Agent state and the mise maps are off too | Always pass the command: `ai-jail claude`. See [Running it](#running-it) |
+| A jailed session leaves `M .ai-jail` in `git status` | `--save-config` is on by default and persists `terminal_passthrough` from the alias | Commit the line, it is inert there, or add `--no-save-config` to the alias. See [the flags that live in an alias](#the-flags-that-live-in-an-alias) |
 | Claude Code renders inline instead of full screen | Output is filtered through a VT parser by default | `terminal_passthrough = true`, or the `--exec` alias in [Part 8](#the-flags-that-live-in-an-alias) |
 | mise tools missing inside the jail | Private home means neither mise config nor installs are mounted | `ro_maps` for both paths, see [Part 8](#my-global-config) |
 | Claude Code asks to log in every run | Agent state is not mounted by default since 1.20 | `agent_state = true` under `[commands.claude]` in `~/.ai-jail` |
@@ -1234,6 +1293,13 @@ if they still reproduce on your version:
 3. **`--init` silently drops flags it cannot persist**, `--exec` among them. It already
    warns when a project config grants something your flags did not, so the mechanism for
    saying something exists.
+4. **`[commands.<name>]` is keyed on the command line, not the resolved command.** With
+   `command = ["claude"]` in the project config, bare `ai-jail` runs Claude Code but never
+   matches `[commands.claude]` in `~/.ai-jail`, so network, agent state and the mise maps
+   all revert to their defaults with no warning. Passing the command explicitly works.
+   Arguably the lookup should use the command ai-jail actually resolved, or at minimum say
+   that a project `command` bypasses the per-command table. Repro is the two `--dry-run`
+   lines in [Running it](#running-it).
 
 **Fixed upstream**, both reported here against earlier versions: display passthrough
 mounting all of `XDG_RUNTIME_DIR` and exposing VS Code IPC sockets on WSL, and host
