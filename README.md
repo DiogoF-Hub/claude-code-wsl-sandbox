@@ -210,6 +210,39 @@ poor inotify support, so VS Code often fails to auto-refresh when the agent writ
 files, which defeats the purpose. It also has no real Unix permission bits, so git
 reports phantom mode changes (`git config core.fileMode false` if you hit it).
 
+### Steering the jailed session from the Claude desktop app
+
+Remote Control changes the ergonomics here more than you would expect. Current Claude Code
+versions connect at startup on their own, so a jailed session comes up with `/rc active`
+in the header and a `claude.ai/code` URL of its own. Open that session in the Claude
+desktop app and you get a real GUI over the same process: a proper conversation pane, a
+diff of the working tree, model and effort controls, and somewhere to type that is not a
+TUI inside a terminal emulator. I now drive most sessions from there.
+
+None of this weakens the jail. The process is still the same bwrap child in WSL with the
+mounts from the dry run, and execution and filesystem access stay on this machine. The
+desktop app is a front end, not a second agent. Two pieces of the setup are what make it
+work inside the jail at all: `network = true`, without which it cannot register, and
+`agent_state = true`, which mounts the `~/.claude/settings.json` holding the toggles.
+
+The split I ended up with:
+
+- **VS Code**, open on the project, for reading files myself and watching edits land
+- **The desktop app**, attached to the session, for actually driving it
+- **The terminal**, for launching `ai-jail claude` and running the commit block
+
+Worth knowing before leaving it on:
+
+- Running `/remote-control` while connected opens a panel with the session URL, a QR code
+  for another device, and a disconnect option that drops the connection while the local
+  session keeps running.
+- Auto-connect is `remoteControlAtStartup` in `~/.claude/settings.json`, or
+  **Settings > Claude Code > Enable remote control by default** in the desktop app.
+  `disableRemoteControl` turns the feature off outright.
+- A connected session stores its transcript on Anthropic servers, which is a different
+  trade from everything else here. See
+  [Security notes](#what-it-does-not-protect).
+
 ---
 
 ## Part 3: Claude Code
@@ -1244,6 +1277,13 @@ Verified empirically from inside a running jail:
 - **No default credential denylist.** Every `mask` is operator-supplied, and masks only
   cover files that exist at launch. The threat model is *contain the host blast radius*,
   not *keep secrets from the agent*.
+- **Remote Control moves the transcript off the machine.** A connected session stores the
+  conversation, including tool activity, on Anthropic servers so devices stay in sync, and
+  anyone signed in who can reach that session can steer the agent inside the jail. The
+  sandbox itself is unchanged, but the boundary this guide draws is a filesystem one, not
+  a "nothing leaves the machine" one. Disconnect from the `/remote-control` panel per
+  session, or set `remoteControlAtStartup` to `false`. See
+  [Part 2](#steering-the-jailed-session-from-the-claude-desktop-app).
 - **Kernel escapes are out of scope**, per the author. For genuinely untrusted code, use
   a disposable VM.
 
