@@ -6,7 +6,17 @@ no_status_bar = true
 
 [commands.claude]
 network = true
-agent_state = true
 terminal_passthrough = true
-rw_maps = ["~/.cache"]
+
+# Default since 2.6.0. Kept explicit in case the default flips back again.
+agent_state = true
+
+# Since 2.5.0 toolchains give the jail its own persistent ~/.cache
+# (~/.local/share/ai-jail/cache/xdg), kept apart from the host's. Mapping the
+# host ~/.cache here would override that. Uncomment only to share host caches,
+# e.g. Playwright browsers already installed outside the jail.
+# rw_maps = ["~/.cache"]
+
+# Mapped read-only automatically since 2.4.1 while mise is enabled. Kept
+# explicit in case that changes.
 ro_maps = ["~/.config/mise", "~/.local/share/mise"]

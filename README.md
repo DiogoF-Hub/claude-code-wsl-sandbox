@@ -223,7 +223,8 @@ None of this weakens the jail. The process is still the same bwrap child in WSL 
 mounts from the dry run, and execution and filesystem access stay on this machine. The
 desktop app is a front end, not a second agent. Two pieces of the setup are what make it
 work inside the jail at all: `network = true`, without which it cannot register, and
-`agent_state = true`, which mounts the `~/.claude/settings.json` holding the toggles.
+agent state, which mounts the `~/.claude/settings.json` holding the toggles. Agent state
+is on by default since ai-jail 2.6.0, and my global config sets it explicitly anyway.
 
 The split I ended up with:
 
@@ -685,9 +686,12 @@ VS Code uses the global Git config, so nothing extra to configure inside it.
 
 ## Part 8: The .ai-jail config
 
-Written against **ai-jail 1.20.x**. Earlier versions had permissive defaults and a
+Written against **ai-jail 2.7.x**. Versions before 1.18 had permissive defaults and a
 project config that could grant capabilities, so a guide written for those is now wrong
-in both directions. Check with `ai-jail --version`.
+in both directions. The 2.x line then turned several things back on by default, so a
+guide written for 1.18 to 1.22 overstates what you need to configure. Check with
+`ai-jail --version`, and see [Upstream changes](#upstream-changes-that-matter-here) for
+what changed when.
 
 ### Two files, and only one of them is trusted
 
@@ -705,19 +709,30 @@ To let specific checkouts ship their own capability opt-ins, list their parent d
 under `trust_project_config` in the global config. Keep that list narrow: everything at
 or beneath a listed directory is trusted, including repositories cloned there later.
 
-### The defaults are secure now
+### What is on and off by default
 
-Off unless you ask: network, GPU, display, X11, host `/dev/shm`, terminal passthrough,
-linked worktree metadata, Docker, SSH, Tailscale, the systemd user bus, and the status
-bar's update check.
+Off unless you ask: unrestricted network, GPU, display, X11, audio, host `/dev/shm`,
+terminal passthrough, linked worktree metadata, Docker, SSH, Tailscale, the systemd user
+bus, tool credentials (`--github`, `--aws` and friends), `/dev/kvm`, the audit log, and
+the status bar's update check.
 
-Two that catch people out:
+On by default:
 
-- **Private home is on by default.** `$HOME` is a fresh tmpfs. Nothing under it is
-  mounted unless you map it, which means no `~/.cache` and no mise toolchain.
-- **Agent credential state is not mounted.** `~/.claude` and `~/.claude.json` need
-  `--agent-state`, or Claude Code asks for a fresh login every launch and has no session
-  history.
+- **Private home.** `$HOME` is a fresh tmpfs, and only what ai-jail or you map appears
+  under it.
+- **Agent state** (since 2.6.0). The invoked agent's own state is mounted read-write, so
+  for Claude Code that is `~/.claude` and `~/.claude.json`, and it starts logged in with
+  its session history. `--no-agent-state` turns it off.
+- **mise** (since 2.4.1). `~/.config/mise`, `~/.local/share/mise` and the directory
+  holding the `mise` binary are mapped read-only automatically.
+- **Toolchain caches** (since 2.5.0, Linux). `~/.cache`, `~/.npm` and the other common
+  cache paths are backed by a persistent store ai-jail owns under
+  `~/.local/share/ai-jail/cache/`, never by your host's real caches. The store is shared
+  by every project. `--no-toolchains` turns it off.
+- **Filtered egress to package registries** (since 2.5.0). With no network setting at
+  all, the jail can reach crates.io, npm, PyPI, GitHub and a few other registries through
+  ai-jail's proxy, and nothing else. From 2.8.0 a known agent's own API host is added,
+  `api.anthropic.com` for Claude Code.
 
 The environment is a minimal allowlist too, not your shell environment. Extend it with
 `--env NAME`, or `env_pass` in the global config.
@@ -740,22 +755,108 @@ no_status_bar = true
 
 [commands.claude]
 network = true
-agent_state = true
 terminal_passthrough = true
-rw_maps = ["~/.cache"]
+
+# Default since 2.6.0. Kept explicit in case the default flips back again.
+agent_state = true
+
+# Since 2.5.0 toolchains give the jail its own persistent ~/.cache
+# (~/.local/share/ai-jail/cache/xdg), kept apart from the host's. Mapping the
+# host ~/.cache here would override that. Uncomment only to share host caches,
+# e.g. Playwright browsers already installed outside the jail.
+# rw_maps = ["~/.cache"]
+
+# Mapped read-only automatically since 2.4.1 while mise is enabled. Kept
+# explicit in case that changes.
 ro_maps = ["~/.config/mise", "~/.local/share/mise"]
 ```
 
 | Line | Why |
 | --- | --- |
-| `network = true` | Claude Code cannot reach the API without it. Note what you are granting: unrestricted egress, so anything readable in the sandbox can leave. |
-| `agent_state = true` | Mounts `~/.claude` and `~/.claude.json`, so the login and session history persist. The trade is real: that directory holds a live OAuth token and supports hooks that run shell commands, and everything in the sandbox can reach it. |
+| `network = true` | Claude Code cannot reach the API without it on 2.7, and its features reach well beyond the API host. Note what you are granting: unrestricted egress, so anything readable in the sandbox can leave. |
+| `agent_state = true` | Mounts `~/.claude` and `~/.claude.json`, so the login and session history persist. Redundant since 2.6.0, kept so the file still says what it means if the default changes again. The trade is real: that directory holds a live OAuth token and supports hooks that run shell commands, and everything in the sandbox can reach it. |
 | `terminal_passthrough = true` | Output is filtered through a VT parser by default, which breaks full-screen TUI rendering. Raw forwarding fixes it and exposes the terminal's clipboard, query and parser surface. |
-| `rw_maps = ["~/.cache"]` | Restores caches that private home would otherwise discard, Playwright browsers among them. |
-| `ro_maps = [mise config, mise installs]` | mise needs both: the config says which versions are active, the installs hold the binaries. With neither present, ai-jail skips activation entirely. |
+| `# rw_maps = ["~/.cache"]` | Commented out on purpose. Before 2.5.0 this was the only way to keep caches between sessions. Now the jail gets its own persistent `~/.cache`, and this line would replace it with your real host one, so a jailed build could write into what host builds read. Uncomment it only if sharing is the point, for example reusing Playwright browsers already downloaded on the host. |
+| `ro_maps = [mise config, mise installs]` | mise needs both: the config says which versions are active, the installs hold the binaries. Redundant since 2.4.1, which maps both read-only itself, and kept for the same reason as `agent_state`. |
 
-Both mise paths are read-only on purpose. The agent needs to run those tools, not
-install new ones.
+Both mise paths are read-only on purpose, and ai-jail's own maps are too. The agent needs
+to run those tools, not install new ones. Since 2.6.1 ai-jail also sets
+`MISE_NOT_FOUND_AUTO_INSTALL=false` inside the jail, so a missing tool fails once and
+cleanly rather than on every call.
+
+### Optional: a cache per project
+
+The jail's cache store is shared by every project. I keep it that way on purpose, but
+giving each project its own `~/.cache` takes one line, so here is how.
+
+| | Shared store (default) | Per project |
+| --- | --- | --- |
+| One project's builds affecting another's | Possible | No |
+| Disk | One copy of everything | Each project downloads its own (Playwright browsers alone are hundreds of MB) |
+| Setup per repo | None | A directory and a `.gitignore` entry |
+
+The isolation only matters against something hostile, not an agent that wanders, so for
+this guide's threat model the shared store wins.
+
+**1. Map a project-relative directory onto `~/.cache` in `~/.ai-jail`.** A relative
+source is resolved against the project you launch from, so one global line gives every
+project its own:
+
+```toml
+[commands.claude]
+rw_maps = [".jail-cache:~/.cache"]
+```
+
+It replaces the commented-out host map, since only one thing can sit at `~/.cache`. It has
+to go in the global config: in a project `.ai-jail` it is ignored with
+`map .jail-cache outside project ignored`, because untrusted project files may not map
+anything outside the project, and `~/.cache` is outside it. For a one-off, pass
+`--rw-map .jail-cache:~/.cache` on the command line instead.
+
+**2. Opt each project in by creating the directory.** ai-jail does not create it:
+
+```bash
+cd ~/Projects/my-app
+mkdir .jail-cache
+echo '.jail-cache/' >> .gitignore
+```
+
+A project without the directory still launches, with
+`⚠ Path <project>/.jail-cache not found, skipping.`, and the dry run then shows no
+`~/.cache` mount at all, so its cache lands on the tmpfs home and is gone at exit. That
+makes it opt-in per project rather than all or nothing.
+
+Use the repo's own `.gitignore` rather than a global excludes file. Git's global ignore
+lives in `~/.config/git/ignore`, which is not mounted inside the jail, so a jailed
+`git status` would still list the cache as untracked.
+
+**3. Keep VS Code from watching it.** Search already skips gitignored files, but the file
+watcher does not, and a busy cache generates a lot of events. In
+`.vscode/settings.json`:
+
+```json
+{
+  "files.watcherExclude": { "**/.jail-cache/**": true }
+}
+```
+
+**4. Check it took:**
+
+```bash
+ai-jail --dry-run claude | grep jail-cache
+# --bind /home/diogo/Projects/my-app/.jail-cache /home/diogo/.cache
+```
+
+Worth knowing:
+
+- Only `~/.cache` becomes per project. ai-jail's other cache paths, `~/.npm` and the rest,
+  stay in the shared store unless you add a map for each, for example
+  `".jail-cache/npm:~/.npm"`, and every source directory has to exist first.
+- It exposes nothing new. The directory is inside the project, which the agent can already
+  write.
+- `git clean -fdx` deletes it along with everything else ignored, which is also the
+  quickest way to reset one project's cache.
+- To go back, remove the line from `~/.ai-jail` and delete the `.jail-cache` directories.
 
 ### My project template
 
@@ -792,7 +893,7 @@ keep the file honest if a future version flips a default back.
 | --- | --- |
 | `mask` | Replaces matching project files with empty placeholders. The project directory is writable by default, so in-repo secrets need masking explicitly. `deny_paths` makes them inaccessible instead of empty. |
 | `hide_dotdirs` | Largely moot under private home, since nothing from host `$HOME` is mounted anyway. Kept as belt and braces. |
-| `no_display` | Was load-bearing on WSL before 1.20, when display passthrough mounted all of `XDG_RUNTIME_DIR` and dragged in VS Code's IPC socket. That is fixed upstream: only the validated Wayland socket is mounted now. Claude Code is a TUI, so this costs nothing either way. |
+| `no_display` | Was load-bearing on WSL before 1.18, when display passthrough mounted all of `XDG_RUNTIME_DIR` and dragged in VS Code's IPC socket. That is fixed upstream: only the validated Wayland socket is mounted now. Claude Code is a TUI, so this costs nothing either way. |
 
 ### Masks only cover files that already exist
 
@@ -817,8 +918,8 @@ It interacts badly with the trust model. Pass `--network` once, and auto-save wr
 `network = true` into the project file, where it is then ignored. The session works, the
 next one does not, and the config file appears to say otherwise.
 
-Arguments to the sandboxed command are no longer captured. On 1.20,
-`ai-jail claude --resume <id>` leaves `command = ["claude"]` untouched. Older versions
+Arguments to the sandboxed command are no longer captured. Since 1.20 (rechecked on
+2.7), `ai-jail claude --resume <id>` leaves `command = ["claude"]` untouched. Older versions
 recorded the whole line, which pinned that one session on every later bare run, so if you
 are on an earlier release check the file before assuming.
 
@@ -848,8 +949,9 @@ source ~/.bash_aliases
 > it matches on the path rather than a PID, but you carry a duplicate relay until the shell
 > closes. Ubuntu's stock `.bashrc` sources `~/.bash_aliases` on every new shell anyway.
 
-`--terminal-passthrough` is in the alias because `--exec` needs it. 1.20 refuses `--exec`
-on a TTY without it, so the two travel together rather than being two independent
+`--terminal-passthrough` is in the alias because `--exec` needs it. ai-jail refuses
+`--exec` on a TTY without it (`--exec on a terminal requires --terminal-passthrough`,
+since 1.20 and still on 2.7), so the two travel together rather than being two independent
 preferences. `terminal_passthrough = true` is in my global config as well and the flag is
 *still* required on the command line, because `--exec` is an outer-wrapper concern that
 never reaches the part of ai-jail the config governs. Worth retesting after an upgrade
@@ -885,9 +987,13 @@ Verify what actually took, which is the part that matters:
 ai-jail --dry-run claude | grep -E 'unshare-net|landlock-exec'
 ```
 
-No `--unshare-net` means the network is on. The trailing arguments after
-`/tmp/.ai-jail-landlock` are the resolved policy: `--agent-state`, `--network`,
-`--private-home` and the rest appear there explicitly.
+No `--unshare-net` means unrestricted network. `--unshare-net` alone used to mean
+offline, but since 2.0 it is also how filtered egress looks: the jail has no route of its
+own and reaches the allowed hosts through ai-jail's proxy. Tell them apart by the
+trailing arguments after `/tmp/.ai-jail-landlock`, which are the resolved policy:
+`--network`, or `--no-network` followed by `--allow-host` entries, or `--no-network`
+alone for offline. `--agent-state`, `--private-home` and the rest appear there
+explicitly too.
 
 ### Running it
 
@@ -899,18 +1005,31 @@ ai-jail claude              # run for real
 
 > **Always name the command.** Bare `ai-jail` takes it from `command = ["claude"]` in the
 > project file, and the global `[commands.claude]` table is keyed on the command as given
-> on the *command line*, so it never matches. Every capability silently reverts to the
-> default: no network, no agent state, no mise maps. It surfaces as
+> on the *command line*, so it never matches. Everything in that table reverts to the
+> default. Agent state and mise are on by default since 2.x, so what you actually lose is
+> the network, and `terminal_passthrough` is dropped as well (`project .ai-jail
+> terminal_passthrough ignored because it weakens the baseline sandbox`). Since 1.22
+> ai-jail at least says so at launch:
+>
+> ```
+> ⚠ ai-jail: `claude` is a network API client but network is off (default since v1.18.0) — set `network = true` or pass --network; see `ai-jail status`
+> ```
+>
+> On 1.x, before that warning, it surfaced only as
 > `Failed to connect to api.anthropic.com: EAI_AGAIN`, which reads like a DNS problem
 > rather than a config one. The difference is visible in the dry run:
 >
 > ```bash
-> ai-jail --dry-run | grep -c unshare-net          # 1, network unshared
+> ai-jail --dry-run | grep -c unshare-net          # 1, no unrestricted network
 > ai-jail --dry-run claude | grep -c unshare-net    # 0, table matched
 > ```
+>
+> 2.8.0 gives a bare launch of a known agent filtered access to its own API host, so
+> bare `ai-jail` may reach `api.anthropic.com` from then on. It still is not the same
+> sandbox as `ai-jail claude`, so name the command anyway.
 
 To resume a previous session, pass the flag through or use `/resume` from inside Claude
-Code. On 1.20 the session ID is not written into `.ai-jail`, so this is safe to repeat:
+Code. The session ID is not written into `.ai-jail`, so this is safe to repeat:
 
 ```bash
 ai-jail claude --resume 11f2b4c6-625a-4650-b0c2-96cf276f91f4
@@ -1110,8 +1229,8 @@ not try to escape it.
   exists because the same workaround repeating every session is usually a sign it should
   be solved properly instead: `/usr` is bind-mounted read-only from the host, so
   `sudo apt install` outside the jail makes libraries permanently visible inside it, and
-  `~/.cache` is bind-mounted read-write rather than tmpfs, so downloads landing there
-  survive between sessions.
+  `~/.cache` is backed by ai-jail's persistent cache store rather than tmpfs, so
+  downloads landing there survive between sessions.
 - **The system-package rule invites a request rather than promising a yes.** Host installs
   are permanent and accumulate, so they are worth it for a recurring dependency and not
   for a one-off.
@@ -1184,16 +1303,18 @@ after it, so a hiccup in the Claude Code updater cannot block your system upgrad
 ### Claude Code cannot update itself inside the jail
 
 Native installations auto-update in the background, and `claude update` forces it
-immediately. Both write to the binary at `~/.local/bin/claude`, and the dry run shows
-that path mounted read-only:
+immediately. Both install a new version under `~/.local/share/claude/versions` and
+repoint the `~/.local/bin/claude` symlink, and the dry run shows both mounted read-only:
 
 ```
---ro-bind /home/diogo/.local /home/diogo/.local
+--symlink /home/diogo/.local/share/claude/versions/<version> /home/diogo/.local/bin/claude
+--ro-bind /home/diogo/.local/share/claude/versions /home/diogo/.local/share/claude/versions
+--ro-bind /home/diogo/.local/bin /home/diogo/.local/bin
 ```
 
 So the update fails inside the jail, silently or with a warning. This is deliberate
-rather than a gap: read-only `~/.local` is the same rule that keeps the ai-jail binary
-itself out of the agent's reach and blocks PATH shadowing.
+rather than a gap: the same read-only mounts keep the ai-jail binary itself (under
+`~/.local/share/mise`) out of the agent's reach and block PATH shadowing.
 
 Run `claude` unjailed now and then, or let `all-update` handle it. `claude doctor`
 reports the result of the most recent update attempt, which is the quickest way to check
@@ -1225,12 +1346,14 @@ because the winget package path is stable.
 | Commit shows **Unverified** on GitHub | Key not registered as a Signing key, or email mismatch | [Part 6.1](#61-register-the-key-on-github-twice) |
 | `gpg.ssh.allowedSignersFile needs to be configured` | Local verification not set up, signing itself is fine | [Part 6.3](#63-local-verification-optional) |
 | A capability set in the project `.ai-jail` has no effect | Project config is untrusted and can only tighten | Move it to `~/.ai-jail`, see [Part 8](#two-files-and-only-one-of-them-is-trusted) |
-| Claude Code cannot reach the API | Network is off by default since 1.20 | `network = true` under `[commands.claude]` in `~/.ai-jail` |
-| `Failed to connect to api.anthropic.com: EAI_AGAIN` even though `network = true` is set | Launched as bare `ai-jail`, so the command came from `command = [...]` in the project file and the global `[commands.<name>]` table never matched. Agent state and the mise maps are off too | Always pass the command: `ai-jail claude`. See [Running it](#running-it) |
+| Claude Code cannot reach the API | Unrestricted network is off by default since 1.18 | `network = true` under `[commands.claude]` in `~/.ai-jail` |
+| `⚠ ai-jail: claude is a network API client but network is off` at launch even though `network = true` is set (on 1.x, `Failed to connect to api.anthropic.com: EAI_AGAIN`) | Launched as bare `ai-jail`, so the command came from `command = [...]` in the project file and the global `[commands.<name>]` table never matched | Always pass the command: `ai-jail claude`. See [Running it](#running-it) |
 | A jailed session leaves `M .ai-jail` in `git status` | `--save-config` is on by default and persists `terminal_passthrough` from the alias | Commit the line, it is inert there, or add `--no-save-config` to the alias. See [the flags that live in an alias](#the-flags-that-live-in-an-alias) |
 | Claude Code renders inline instead of full screen | Output is filtered through a VT parser by default | `terminal_passthrough = true`, or the `--exec` alias in [Part 8](#the-flags-that-live-in-an-alias) |
-| mise tools missing inside the jail | Private home means neither mise config nor installs are mounted | `ro_maps` for both paths, see [Part 8](#my-global-config) |
-| Claude Code asks to log in every run | Agent state is not mounted by default since 1.20 | `agent_state = true` under `[commands.claude]` in `~/.ai-jail` |
+| mise tools missing inside the jail | Before 2.4.1, private home mounted neither mise config nor installs. Since then ai-jail maps both itself unless mise is off (`--no-mise`, `--lockdown`) | Upgrade, or `ro_maps` for both paths on older versions, see [Part 8](#my-global-config) |
+| Claude Code asks to log in every run | Agent state was opt-in from 1.18 until 2.6.0. On 2.6 and later it is on unless `--no-agent-state`, `--lockdown` or a browser profile turned it off | `agent_state = true` under `[commands.claude]` in `~/.ai-jail` |
+| `~/.cache` inside the jail does not have what the host's has | Expected since 2.5.0: the jail gets its own persistent cache store, separate from the host's | Nothing, or uncomment `rw_maps = ["~/.cache"]` to share the host's, see [Part 8](#my-global-config) |
+| `⚠ Mask: ... does not exist; rule not applied` at launch | A `mask` entry names a file that is not there, so there is nothing to protect yet | Harmless while the file does not exist. If it gets created later in a session it is *not* masked, see [Masks only cover files that already exist](#masks-only-cover-files-that-already-exist) |
 | Distro stays running after closing all terminals | A detached process: an orphaned relay from a force-killed shell, a dev server, VS Code Server, or Docker Desktop integration | `ps -eo pid,etime,cmd --sort=-etime \| head` to find what is old, then `wsl --shutdown`. The sweep in [Part 5.3](#53-the-bashrc-block) clears orphaned relays on the next shell |
 | Bitwarden prompts on VS Code window focus | VS Code Git auto-fetch, not signing | `"git.autofetch": false` in `.vscode/settings.json` |
 
@@ -1253,25 +1376,31 @@ Verified empirically from inside a running jail:
 - **Around 40 syscalls blocked** by seccomp: the whole mount family, `ptrace`, `bpf`,
   `unshare`/`setns`, `io_uring`, keyring, `kexec`, module loading
 - **Landlock LSM** enforced at VFS level, on top of the mount layout
-- **`~/.local` read-only**, so the ai-jail binary itself is out of reach and PATH
+- **Only read-only parts of `~/.local` are mounted** (`bin`, `share/mise`,
+  `share/claude/versions`), so the ai-jail binary itself is out of reach and PATH
   shadowing is blocked
 
 ### What it does not protect
 
-- **Network egress is unfiltered when you enable it.** bwrap either unshares the network
-  namespace or does not; there is no middle ground. `--network` is all or nothing, and
-  Claude Code needs it, so anything readable in the sandbox can leave. `--allow-tcp-port`
-  is still accepted for compatibility but now fails closed, because UDP cannot be
+- **`network = true` is unfiltered egress.** Anything readable in the sandbox can leave.
+  Since 2.0 there is a middle ground, `allow_hosts` / `--allow-host`, which keeps the jail
+  off the network and lets it reach only listed hosts through a CONNECT proxy. It is not
+  used here: Claude Code reaches more than its API host (login, web fetches, Remote
+  Control), the cost of a missed host is a broken session, and an allowed host is trusted
+  wholesale anyway. Untested with this setup, so treat it as an option rather than a
+  recipe. `--allow-tcp-port` is still parsed but rejected at launch, because UDP cannot be
   constrained through it. `--lockdown` blocks network and makes the project read-only,
   which suits review work rather than coding.
-- **`--agent-state` hands over a live credential.** `~/.claude` holds
-  `.credentials.json`, an OAuth token, and supports hooks that run shell commands, which
-  is a persistence path into future *unjailed* sessions. It is opt-in now, but Claude
-  Code is impractical without it. `chattr +i ~/.claude/settings.json` closes the hook
-  path specifically, at the cost of `chattr -i` whenever you change a setting.
-- **Every map you add is a hole you chose.** `rw_maps = ["~/.cache"]` is convenient and
-  low-value, but it is host state the agent can write. Audit the list occasionally rather
-  than letting it grow.
+- **Agent state hands over a live credential.** `~/.claude` holds `.credentials.json`, an
+  OAuth token, and supports hooks that run shell commands, which is a persistence path
+  into future *unjailed* sessions. It is on by default since 2.6.0, which also copies
+  `ANTHROPIC_API_KEY` in from the host when it is set. `chattr +i
+  ~/.claude/settings.json` closes the hook path specifically, at the cost of `chattr -i`
+  whenever you change a setting.
+- **Every map you add is a hole you chose.** That is why `rw_maps = ["~/.cache"]` is
+  commented out here: since 2.5.0 the jail has its own cache, and mapping the host's
+  would only add host state the agent can write. Audit the list occasionally rather than
+  letting it grow.
 - **The agent can open listening ports** once network is on. Check from the host:
   `ss -lptn | grep -v 127.0.0.1`
 - **No default credential denylist.** Every `mask` is operator-supplied, and masks only
@@ -1287,10 +1416,13 @@ Verified empirically from inside a running jail:
 - **Kernel escapes are out of scope**, per the author. For genuinely untrusted code, use
   a disposable VM.
 
-### What 1.20 fixed
+### Upstream changes that matter here
 
-Three of these were findings from an earlier version of this guide, so they are worth
-recording as closed rather than deleted:
+Taken from the ai-jail release notes, which only carry real notes from 1.18 onward, and
+checked against `--dry-run` on 2.7.0 where they touch this setup.
+
+**What 1.18 fixed.** Three of these were findings from an earlier version of this guide,
+so they are worth recording as closed rather than deleted:
 
 - **Display no longer mounts all of `XDG_RUNTIME_DIR`.** Only the validated Wayland
   socket is bound, and X11 moved behind a separate `--x11`. On WSL the old behaviour
@@ -1299,11 +1431,33 @@ recording as closed rather than deleted:
   spawn processes outside the jail.
 - **Host `/dev/shm` is off by default**, behind `--host-shm`. It used to be bind-mounted
   at mode 1777, a bidirectional channel outside Landlock's file rules by construction.
-- **Agent credentials are no longer mounted by default.** `~/.claude` used to be
-  read-write with no way to hide it.
+- **Agent credentials stopped being mounted by default.** `~/.claude` used to be
+  read-write with no way to hide it. 2.6.0 turned this back on by default, now with
+  `--no-agent-state` to hide it, see below.
 
-Also new: the environment is a minimal allowlist rather than your shell's, and the status
-bar's version check no longer makes an outbound request unless you ask for it.
+Also from 1.18: the environment is a minimal allowlist rather than your shell's, the
+status bar's version check no longer makes an outbound request unless you ask for it, and
+a mask or deny rule on a missing file warns even under `--exec` (1.18.1).
+
+**What 2.x changed.** 2.0 billed itself as fully backward-compatible, and every config
+from this guide still works, but several defaults moved:
+
+- **2.0:** filtered egress (`--allow-host` / `allow_hosts`), an opt-in launch audit log
+  (`--audit-log`, read with `--audit-show`, checked with `--audit-verify`), and
+  `--env-from-file`.
+- **2.4.0:** security fixes from an external audit. Seccomp now catches a `TIOCSTI`
+  terminal-injection bypass, Landlock also scopes abstract Unix sockets and signals on
+  kernels with Landlock ABI 6 (6.12 and later), and worktree metadata can no longer be
+  pointed at an arbitrary host directory.
+- **2.4.1:** mise config and installs are mapped read-only automatically.
+- **2.5.0:** toolchain caches on by default, in a store separate from the host's, plus
+  default filtered egress to package registries when no network setting is given.
+- **2.6.0:** agent state on by default.
+- **2.6.2:** `--env` values no longer appear on the launcher's command line, where any
+  process running as you could read them.
+- **2.8.0:** a bare launch of a known agent also gets filtered egress to its own API host,
+  `api.anthropic.com` for Claude Code. 2.8.1 keeps that host when `--allow-host` adds
+  others. Not yet tested here.
 
 ### Scope creep is not a security control
 
@@ -1318,10 +1472,11 @@ behaviour, use Claude Code's own permission system (`/permissions`, written to
 Worth reporting to [akitaonrails/ai-jail](https://github.com/akitaonrails/ai-jail/issues)
 if they still reproduce on your version:
 
-1. **`/etc/resolv.conf` symlink breaks startup on WSL.** ai-jail already binds
-   `/mnt/wsl/resolv.conf`, so it has some WSL awareness, but it does not handle
-   `/etc/resolv.conf` being a symlink to it. Covered in
-   [Part 1.2](#12-fix-etcresolvconf-required-for-ai-jail).
+1. **`/etc/resolv.conf` symlink breaks startup on WSL.** ai-jail has some WSL awareness,
+   but did not handle `/etc/resolv.conf` being a symlink to `/mnt/wsl/resolv.conf`.
+   Covered in [Part 1.2](#12-fix-etcresolvconf-required-for-ai-jail). Not retested on
+   2.x: the dry run now binds a generated copy over `/etc/resolv.conf`, so it may be
+   fixed, but checking means undoing Part 1.2 on the host.
 2. **TUI apps cannot use the alternate screen.** `--dev /dev` gives the sandbox a fresh
    devpts instance, so the inherited pty has no node inside it: `isatty()` still passes
    because the fd is a real pty, but `ttyname()` fails because there is nothing to name.
@@ -1335,16 +1490,18 @@ if they still reproduce on your version:
    saying something exists.
 4. **`[commands.<name>]` is keyed on the command line, not the resolved command.** With
    `command = ["claude"]` in the project config, bare `ai-jail` runs Claude Code but never
-   matches `[commands.claude]` in `~/.ai-jail`, so network, agent state and the mise maps
-   all revert to their defaults with no warning. Passing the command explicitly works.
-   Arguably the lookup should use the command ai-jail actually resolved, or at minimum say
-   that a project `command` bypasses the per-command table. Repro is the two `--dry-run`
-   lines in [Running it](#running-it).
+   matches `[commands.claude]` in `~/.ai-jail`, so everything in that table reverts to the
+   default. Passing the command explicitly works. Still reproduces on 2.7.0, though it
+   bites less: agent state and mise are now on by default, and since 1.22 a launch warning
+   names the missing network. That warning already identifies the resolved command as
+   `claude`, which suggests the lookup could use it too, or at minimum say that a project
+   `command` bypasses the per-command table. Repro is the two `--dry-run` lines in
+   [Running it](#running-it).
 
 **Fixed upstream**, both reported here against earlier versions: display passthrough
 mounting all of `XDG_RUNTIME_DIR` and exposing VS Code IPC sockets on WSL, and host
 `/dev/shm` being bind-mounted by default. See
-[What 1.20 fixed](#what-120-fixed).
+[Upstream changes](#upstream-changes-that-matter-here).
 
 ---
 
